@@ -12,7 +12,6 @@ from unittest.mock import patch
 
 import pytest
 
-# 加载 hooks/check-bash.py（带连字符，不能直接 import）
 _check_bash_path = os.path.join(os.path.dirname(__file__), "..", "hooks", "check-bash.py")
 spec = importlib.util.spec_from_file_location("check_bash", _check_bash_path)
 check_bash = importlib.util.module_from_spec(spec)
@@ -37,22 +36,6 @@ class TestSafePattern:
             assert not check_bash.SAFE_PATTERN.match(cmd.strip()), f"'{cmd}' should not be safe"
 
 
-class TestLongPattern:
-    def test_long_commands(self):
-        long_cmds = ["apt-get install python3", "pip install flask",
-                     "npm install express", "docker run nginx",
-                     "git push origin main", "git clone https://...",
-                     "sleep 30", "curl https://example.com", "make build",
-                     "cargo build --release", "npx playwright test"]
-        for cmd in long_cmds:
-            assert check_bash.LONG_PATTERN.search(cmd), f"'{cmd}' should be long"
-
-    def test_non_long_commands(self):
-        normal = ["ls -la", "pwd", "echo hello", "git status", "grep foo"]
-        for cmd in normal:
-            assert not check_bash.LONG_PATTERN.search(cmd), f"'{cmd}' should not be long"
-
-
 class TestBackgroundTracking:
     @pytest.fixture
     def temp_bg_file(self):
@@ -65,24 +48,28 @@ class TestBackgroundTracking:
 
     def test_track_and_load(self, temp_bg_file):
         check_bash.track_background("pip install flask")
-        tasks = check_bash._load_tasks()
+        tasks = json.loads(Path(temp_bg_file).read_text())
         assert len(tasks) == 1
         task = list(tasks.values())[0]
         assert "pip install flask" in task["command"]
-        assert task["notified"] is False
 
     def test_multiple_tasks(self, temp_bg_file):
         check_bash.track_background("task1")
         check_bash.track_background("task2")
-        tasks = check_bash._load_tasks()
+        tasks = json.loads(Path(temp_bg_file).read_text())
         assert len(tasks) == 2
 
     def test_empty(self, temp_bg_file):
-        assert check_bash._load_tasks() == {}
+        # 文件不存在时，track 应正常工作
+        check_bash.track_background("new task")
+        tasks = json.loads(Path(temp_bg_file).read_text())
+        assert len(tasks) == 1
 
     def test_corrupted(self, temp_bg_file):
         Path(temp_bg_file).write_text("{invalid json}")
-        assert check_bash._load_tasks() == {}
+        check_bash.track_background("new task")
+        tasks = json.loads(Path(temp_bg_file).read_text())
+        assert len(tasks) == 1
 
 
 class TestCheckBackgroundTasks:
@@ -94,7 +81,7 @@ class TestCheckBackgroundTasks:
             tasks = {
                 "1": {"command": "pip install", "started_at": time.time() - 660, "notified": False}
             }
-            check_bash._save_tasks(tasks)
+            Path(path).write_text(json.dumps(tasks))
             yield path
         if os.path.exists(path):
             os.unlink(path)
@@ -110,7 +97,7 @@ class TestCheckBackgroundTasks:
             tasks = {
                 "1": {"command": "pip install", "started_at": time.time(), "notified": False}
             }
-            check_bash._save_tasks(tasks)
+            Path(path).write_text(json.dumps(tasks))
             check_bash.check_background_tasks()
         if os.path.exists(path):
             os.unlink(path)
@@ -143,7 +130,7 @@ class TestHookMain:
     def test_background_passthrough(self):
         stderr = self._run({
             "tool_name": "Bash",
-            "tool_input": {"command": "pip install flask", "run_in_background": True}
+            "tool_input": {"command": "sleep 30", "run_in_background": True}
         })
         assert stderr == ""
 
@@ -154,29 +141,34 @@ class TestHookMain:
         })
         assert stderr == ""
 
-    def test_timeout_passthrough(self):
+    def test_fast_command_executes(self):
+        """快速命令（非安全列表）→ hook 执行后放行"""
         stderr = self._run({
             "tool_name": "Bash",
-            "tool_input": {"command": "apt-get install", "timeout": 30000}
+            "tool_input": {"command": "echo hello"}
         })
         assert stderr == ""
 
-    def test_long_command_deny(self):
-        stderr = self._run({
-            "tool_name": "Bash",
-            "tool_input": {"command": "pip install flask"}
-        })
-        result = json.loads(stderr)
-        assert result["decision"] == "deny"
-        assert "reason" in result
+    def test_timeout_deny(self):
+        """模拟超时场景：execute_with_timeout 返回 -1"""
+        with patch.object(check_bash, "execute_with_timeout", return_value=-1):
+            stderr = self._run({
+                "tool_name": "Bash",
+                "tool_input": {"command": "sleep 100"}
+            })
+            result = json.loads(stderr)
+            assert result["decision"] == "deny"
+            assert "timed out" in result["reason"].lower()
 
-    def test_unknown_command_no_timeout_deny(self):
-        stderr = self._run({
-            "tool_name": "Bash",
-            "tool_input": {"command": "some_unknown_tool --do-something"}
-        })
-        result = json.loads(stderr)
-        assert result["decision"] == "deny"
+    def test_execute_timeout_real(self):
+        """实际超时测试：3s timeout 对 10s sleep"""
+        rc = check_bash.execute_with_timeout("sleep 10", 3000)
+        assert rc == -1
+
+    def test_execute_ok_real(self):
+        """快速命令应在 timeout 内完成"""
+        rc = check_bash.execute_with_timeout("echo hi", 5000)
+        assert rc == 0
 
     def test_invalid_json_passthrough(self):
         old_stdin = sys.stdin

@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""PreToolUse hook: 检查 Bash 命令是否可能长时间阻塞。
+"""PreToolUse hook: 为 Bash 命令自动添加 timeout，防止卡死。
 
 协议：
-  exit 0 → 放行（Claude 执行工具）
-  exit 2 + stderr JSON → 拒绝，Claude 看到 reason 后调整
+  输出到 stdout JSON：
+    {"hookSpecificOutput": {"permissionDecision": "allow|deny", "updatedInput": {...}}}
 
 逻辑：
-1. 非 Bash / 已 background → 放行
-2. 有合理 timeout (≤60s) → 放行
-3. 安全命令 → 放行
-4. 可能长时间的命令 → 拒绝，提示用 background
-5. 无 timeout → 拒绝，提示加 timeout 或 background
+1. 非 Bash → 放行
+2. 已有 run_in_background → 放行，记录跟踪
+3. 已有合理的 timeout → 放行
+4. 安全命令 → 放行
+5. 否则 → 在 updatedInput 中添加 timeout: 60000（60s），然后放行
+   这样如果命令超时，Claude 会看到超时错误，自然知道该用 background
 6. 后台任务 > 10 分钟 → 通知
 """
 
@@ -32,14 +33,6 @@ SAFE_PATTERN = re.compile(
     r'python3 -c\b|python3 -m pytest|msgbox\b)'
 )
 
-LONG_PATTERN = re.compile(
-    r'(apt-get|apt |pip install|npm install|pnpm install|yarn add|'
-    r'docker |docker-compose|kubectl |terraform |ansible |sleep |'
-    r'curl\b|wget\b|rsync |scp |git clone|git push|git pull|'
-    r'make |cmake |bazel |mvn |gradle |cargo build|cargo test|'
-    r'npx |playwright)'
-)
-
 
 def _load_tasks() -> dict:
     if not os.path.exists(BG_TRACKING_FILE):
@@ -58,7 +51,6 @@ def _save_tasks(tasks: dict):
 
 
 def check_background_tasks():
-    """检查后台任务，超过 10 分钟未完成的发通知。"""
     tasks = _load_tasks()
     now = time.time()
     remaining = {}
@@ -77,18 +69,20 @@ def check_background_tasks():
     if notified:
         for task in notified:
             result = {
-                "decision": "deny",
-                "reason": (
-                    f"Background task running for over 10 minutes: "
-                    f"{task.get('command', 'unknown')[:100]}"
-                ),
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        f"Background task running for over 10 minutes: "
+                        f"{task.get('command', 'unknown')[:100]}"
+                    ),
+                }
             }
-            print(json.dumps(result), file=sys.stderr)
-            sys.exit(2)
+            print(json.dumps(result))
+            sys.exit(0)
 
 
 def track_background(command: str):
-    """记录 background 任务。"""
     tasks = _load_tasks()
     key = str(int(time.time() * 1000))
     while key in tasks:
@@ -115,33 +109,39 @@ def main():
     timeout = tool_input.get("timeout")
     run_bg = tool_input.get("run_in_background", False)
 
+    # 非 Bash → 放行
     if data.get("tool_name") != "Bash":
         sys.exit(0)
 
+    # 已 background → 放行（记录跟踪）
     if run_bg:
         track_background(command)
         sys.exit(0)
 
-    if timeout is not None and isinstance(timeout, (int, float)) and 0 < timeout <= 60000:
+    # 已有 timeout → 放行
+    if timeout is not None:
         sys.exit(0)
 
+    # 安全命令 → 放行
     if SAFE_PATTERN.match(command.strip()):
         sys.exit(0)
 
-    if LONG_PATTERN.search(command):
-        result = {
-            "decision": "deny",
-            "reason": "This command may take a long time. Re-run with `run_in_background: true`.",
-        }
-        print(json.dumps(result), file=sys.stderr)
-        sys.exit(2)
+    # 其他命令 → 自动加 timeout
+    updated = dict(tool_input)
+    updated["timeout"] = 60000
+    if "description" not in updated:
+        updated["description"] = f"Auto-added 60s timeout to prevent blocking"
 
     result = {
-        "decision": "deny",
-        "reason": "No timeout set. Add `timeout: 30000` or use `run_in_background: true`.",
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": "Added 60s timeout to prevent blocking. If it times out, retry with run_in_background: true.",
+            "updatedInput": updated,
+        }
     }
-    print(json.dumps(result), file=sys.stderr)
-    sys.exit(2)
+    print(json.dumps(result))
+    sys.exit(0)
 
 
 if __name__ == "__main__":

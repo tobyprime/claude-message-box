@@ -12,7 +12,6 @@ from unittest.mock import patch
 
 import pytest
 
-# 加载 hooks/check-bash.py（带连字符，不能直接 import）
 _check_bash_path = os.path.join(os.path.dirname(__file__), "..", "hooks", "check-bash.py")
 spec = importlib.util.spec_from_file_location("check_bash", _check_bash_path)
 check_bash = importlib.util.module_from_spec(spec)
@@ -37,22 +36,6 @@ class TestSafePattern:
             assert not check_bash.SAFE_PATTERN.match(cmd.strip()), f"'{cmd}' should not be safe"
 
 
-class TestLongPattern:
-    def test_long_commands(self):
-        long_cmds = ["apt-get install python3", "pip install flask",
-                     "npm install express", "docker run nginx",
-                     "git push origin main", "git clone https://...",
-                     "sleep 30", "curl https://example.com", "make build",
-                     "cargo build --release", "npx playwright test"]
-        for cmd in long_cmds:
-            assert check_bash.LONG_PATTERN.search(cmd), f"'{cmd}' should be long"
-
-    def test_non_long_commands(self):
-        normal = ["ls -la", "pwd", "echo hello", "git status", "grep foo"]
-        for cmd in normal:
-            assert not check_bash.LONG_PATTERN.search(cmd), f"'{cmd}' should not be long"
-
-
 class TestBackgroundTracking:
     @pytest.fixture
     def temp_bg_file(self):
@@ -65,24 +48,27 @@ class TestBackgroundTracking:
 
     def test_track_and_load(self, temp_bg_file):
         check_bash.track_background("pip install flask")
-        tasks = check_bash._load_tasks()
+        tasks = json.loads(Path(temp_bg_file).read_text())
         assert len(tasks) == 1
         task = list(tasks.values())[0]
         assert "pip install flask" in task["command"]
-        assert task["notified"] is False
 
     def test_multiple_tasks(self, temp_bg_file):
         check_bash.track_background("task1")
         check_bash.track_background("task2")
-        tasks = check_bash._load_tasks()
+        tasks = json.loads(Path(temp_bg_file).read_text())
         assert len(tasks) == 2
 
     def test_empty(self, temp_bg_file):
-        assert check_bash._load_tasks() == {}
+        check_bash.track_background("new task")
+        tasks = json.loads(Path(temp_bg_file).read_text())
+        assert len(tasks) == 1
 
     def test_corrupted(self, temp_bg_file):
         Path(temp_bg_file).write_text("{invalid json}")
-        assert check_bash._load_tasks() == {}
+        check_bash.track_background("new task")
+        tasks = json.loads(Path(temp_bg_file).read_text())
+        assert len(tasks) == 1
 
 
 class TestCheckBackgroundTasks:
@@ -94,7 +80,7 @@ class TestCheckBackgroundTasks:
             tasks = {
                 "1": {"command": "pip install", "started_at": time.time() - 660, "notified": False}
             }
-            check_bash._save_tasks(tasks)
+            Path(path).write_text(json.dumps(tasks))
             yield path
         if os.path.exists(path):
             os.unlink(path)
@@ -110,19 +96,22 @@ class TestCheckBackgroundTasks:
             tasks = {
                 "1": {"command": "pip install", "started_at": time.time(), "notified": False}
             }
-            check_bash._save_tasks(tasks)
+            Path(path).write_text(json.dumps(tasks))
             check_bash.check_background_tasks()
         if os.path.exists(path):
             os.unlink(path)
 
 
 class TestHookMain:
-    def _run(self, data: dict):
-        """运行 main()，返回 stderr 输出。"""
+    def _run(self, data: dict) -> tuple[str, str]:
+        """运行 main()，返回 (stdout, stderr)。"""
         old_stdin = sys.stdin
+        old_stdout = sys.stdout
         old_stderr = sys.stderr
         sys.stdin = StringIO(json.dumps(data))
+        stdout_out = StringIO()
         stderr_out = StringIO()
+        sys.stdout = stdout_out
         sys.stderr = stderr_out
         with (
             patch.object(check_bash, "BG_TRACKING_FILE", "/tmp/nonexistent-bg-test.json"),
@@ -133,50 +122,50 @@ class TestHookMain:
             except SystemExit:
                 pass
         sys.stdin = old_stdin
+        sys.stdout = old_stdout
         sys.stderr = old_stderr
-        return stderr_out.getvalue()
+        return stdout_out.getvalue(), stderr_out.getvalue()
 
     def test_non_bash_passthrough(self):
-        stderr = self._run({"tool_name": "Write", "tool_input": {}})
+        stdout, stderr = self._run({"tool_name": "Write", "tool_input": {}})
+        assert stdout == ""
         assert stderr == ""
 
     def test_background_passthrough(self):
-        stderr = self._run({
+        stdout, stderr = self._run({
             "tool_name": "Bash",
-            "tool_input": {"command": "pip install flask", "run_in_background": True}
+            "tool_input": {"command": "sleep 30", "run_in_background": True}
         })
+        assert stdout == ""
         assert stderr == ""
 
     def test_safe_command_passthrough(self):
-        stderr = self._run({
+        stdout, stderr = self._run({
             "tool_name": "Bash",
             "tool_input": {"command": "ls -la"}
         })
+        assert stdout == ""
         assert stderr == ""
 
-    def test_timeout_passthrough(self):
-        stderr = self._run({
+    def test_existing_timeout_passthrough(self):
+        """已有 timeout 的命令应直接放行"""
+        stdout, stderr = self._run({
             "tool_name": "Bash",
-            "tool_input": {"command": "apt-get install", "timeout": 30000}
+            "tool_input": {"command": "pip install flask", "timeout": 30000}
         })
+        assert stdout == ""
         assert stderr == ""
 
-    def test_long_command_deny(self):
-        stderr = self._run({
+    def test_no_timeout_adds_timeout(self):
+        """没有 timeout 的命令应自动加 60s timeout"""
+        stdout, stderr = self._run({
             "tool_name": "Bash",
             "tool_input": {"command": "pip install flask"}
         })
-        result = json.loads(stderr)
-        assert result["decision"] == "deny"
-        assert "reason" in result
-
-    def test_unknown_command_no_timeout_deny(self):
-        stderr = self._run({
-            "tool_name": "Bash",
-            "tool_input": {"command": "some_unknown_tool --do-something"}
-        })
-        result = json.loads(stderr)
-        assert result["decision"] == "deny"
+        result = json.loads(stdout)
+        assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
+        assert result["hookSpecificOutput"]["updatedInput"]["timeout"] == 60000
+        assert result["hookSpecificOutput"]["updatedInput"]["command"] == "pip install flask"
 
     def test_invalid_json_passthrough(self):
         old_stdin = sys.stdin

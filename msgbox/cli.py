@@ -373,17 +373,19 @@ def cmd_source_github(args):
     events = args.events or gh_config.get("events", ["*"])
     foreground = args.foreground
 
-    # Auto-detect bot's GitHub username from gh auth
+    # Auto-detect bot's GitHub username from gh auth, fallback to config
     import subprocess
+    self_user = gh_config.get("self_user", "")
     try:
-        self_user = subprocess.run(
+        detected = subprocess.run(
             ["gh", "api", "user", "--jq", ".login"],
             capture_output=True, text=True, timeout=5
         ).stdout.strip()
-        if self_user:
+        if detected:
+            self_user = detected
             print(f"Bot user detected: {self_user} (own events will be ignored)")
     except Exception:
-        self_user = ""
+        pass
 
     if not repos:
         repos = None

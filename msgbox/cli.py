@@ -397,6 +397,40 @@ def cmd_source_github(args):
     )
 
 
+# ── msgbox history ──────────────────────────────────────────
+
+
+def cmd_history(args):
+    """浏览历史消息"""
+    central_db.init_central_db(config.CENTRAL_DB)
+
+    msgs = central_db.get_messages(
+        config.CENTRAL_DB,
+        limit=args.limit,
+        offset=args.offset,
+        categories=tuple(args.category) if args.category else None,
+        type_pattern=args.type,
+    )
+
+    if not msgs:
+        print("No messages found")
+        return
+
+    popups = [m for m in msgs if m["category"] == "popup"]
+    normals = [m for m in msgs if m["category"] == "normal"]
+    silents = [m for m in msgs if m["category"] == "silent"]
+
+    cfg = load_config()
+    templates = cfg.get("templates", {})
+    output = render_brief(
+        templates.get("brief", ""),
+        templates.get("item", ""),
+        popups, normals, silents,
+    )
+    print(output)
+    print(f"--- {len(msgs)} messages (offset={args.offset}) ---")
+
+
 # ── msgbox list-sessions ────────────────────────────────────
 
 
@@ -462,6 +496,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("subscriptions", help="List active subscriptions")
     sp.set_defaults(func=cmd_subscriptions)
+
+    sp = sub.add_parser("history", help="Browse historical messages")
+    sp.add_argument("--limit", "-n", type=int, default=20, help="Number of messages (default: 20)")
+    sp.add_argument("--offset", "-o", type=int, default=0, help="Start offset")
+    sp.add_argument("--category", "-c", nargs="*", choices=["popup", "normal", "silent"], help="Filter by category")
+    sp.add_argument("--type", "-t", help="Filter by type pattern (e.g. github.issue)")
+    sp.set_defaults(func=cmd_history)
 
     cp = sub.add_parser("config", help="Manage configuration")
     csub = cp.add_subparsers(dest="config_cmd")

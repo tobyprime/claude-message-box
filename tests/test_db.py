@@ -84,3 +84,58 @@ class TestUnreadPopupCount:
         assert central_db.get_unread_popup_count(db_path, set()) == 2
         assert central_db.get_unread_popup_count(db_path, {1, 2}) == 0
         assert central_db.get_unread_popup_count(db_path, {1}) == 1
+
+
+class TestGetMessages:
+    def test_all(self, db_path):
+        for i in range(5):
+            central_db.insert_message(db_path, f"type.{i}", f"Title {i}", f"Content {i}")
+        msgs = central_db.get_messages(db_path)
+        assert len(msgs) == 5
+        # 默认降序
+        assert msgs[0]["id"] == 5
+        assert msgs[-1]["id"] == 1
+
+    def test_limit(self, db_path):
+        for i in range(10):
+            central_db.insert_message(db_path, f"t.{i}", f"Title {i}", f"C{i}")
+        msgs = central_db.get_messages(db_path, limit=3)
+        assert len(msgs) == 3
+        assert msgs[0]["id"] == 10
+
+    def test_offset(self, db_path):
+        for i in range(10):
+            central_db.insert_message(db_path, f"t.{i}", f"Title {i}", f"C{i}")
+        msgs = central_db.get_messages(db_path, limit=3, offset=5)
+        assert len(msgs) == 3
+        # offset 5, 降序 → id 5,4,3
+        assert msgs[0]["id"] == 5
+        assert msgs[-1]["id"] == 3
+
+    def test_category_filter(self, db_path):
+        central_db.insert_message(db_path, "a", "t", "c", category="popup")
+        central_db.insert_message(db_path, "b", "t", "c", category="normal")
+        central_db.insert_message(db_path, "c", "t", "c", category="silent")
+
+        msgs = central_db.get_messages(db_path, categories=("popup",))
+        assert len(msgs) == 1
+        assert msgs[0]["category"] == "popup"
+
+        msgs = central_db.get_messages(db_path, categories=("popup", "normal"))
+        assert len(msgs) == 2
+
+    def test_type_pattern(self, db_path):
+        central_db.insert_message(db_path, "github.issue", "t", "c")
+        central_db.insert_message(db_path, "github.pr", "t", "c")
+        central_db.insert_message(db_path, "custom.event", "t", "c")
+
+        msgs = central_db.get_messages(db_path, type_pattern="github.*")
+        assert len(msgs) == 2
+        assert all(m["type"].startswith("github.") for m in msgs)
+
+        msgs = central_db.get_messages(db_path, type_pattern="custom.*")
+        assert len(msgs) == 1
+
+    def test_empty_db(self, db_path):
+        msgs = central_db.get_messages(db_path)
+        assert msgs == []

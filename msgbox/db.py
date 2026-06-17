@@ -131,3 +131,44 @@ def get_undelivered_messages(db_path: str, excluded_ids: set[int], categories: t
         lambda c: c.execute(sql, list(categories) + params + [limit]).fetchall(),
     )
     return [dict(r) for r in rows]
+
+
+def get_messages(
+    db_path: str,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    categories: tuple[str, ...] | None = None,
+    type_pattern: str | None = None,
+) -> list[dict]:
+    """查询历史消息，支持分页和类别/类型过滤。
+
+    SELECT * FROM messages
+    [WHERE category IN (...)]
+    [AND type LIKE ...]
+    ORDER BY id DESC
+    LIMIT ? OFFSET ?
+    """
+    conditions: list[str] = []
+    params: list = []
+
+    if categories:
+        cat_placeholders = ",".join("?" * len(categories))
+        conditions.append(f"category IN ({cat_placeholders})")
+        params.extend(categories)
+
+    if type_pattern:
+        conditions.append("type LIKE ?")
+        params.append(type_pattern.replace("*", "%"))
+
+    where_clause = ""
+    if conditions:
+        where_clause = " WHERE " + " AND ".join(conditions)
+
+    sql = f"SELECT * FROM messages{where_clause} ORDER BY id DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    rows = _with_cursor(
+        db_path,
+        lambda c: c.execute(sql, params).fetchall(),
+    )
+    return [dict(r) for r in rows]

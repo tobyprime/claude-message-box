@@ -113,13 +113,14 @@ def cmd_wait(args):
         popups = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("popup",))
         session_db.mark_delivered(db_path, [m["id"] for m in popups])
         output = render_brief(brief_template, item_template, popups, [])
-        print(output)
-        return
+        print(output, file=sys.stderr)
+        sys.exit(2)
 
     # Phase 2+3: 单循环轮询（先 idle 区间，后 sleep 区间）
     elapsed = 0
     poll_interval = 5
-    while elapsed < sleep_duration:
+    total_duration = idle_duration + sleep_duration
+    while elapsed < total_duration:
         time.sleep(poll_interval)
         elapsed += poll_interval
         excluded_ids = session_db.get_excluded_ids(db_path)
@@ -129,10 +130,11 @@ def cmd_wait(args):
             msgs = [m for m in normals if m["category"] == "normal"]
             session_db.mark_delivered(db_path, [m["id"] for m in normals])
             output = render_brief(brief_template, item_template, popups, msgs)
-            print(output)
-            return
+            print(output, file=sys.stderr)
+            sys.exit(2)
 
-    # 无消息 — exit 2 让 hooks 继续
+    # 无消息 — 报告状态后告知 Claude
+    print(f"Waited {total_duration}s, no new messages", file=sys.stderr)
     sys.exit(2)
 
 
@@ -192,7 +194,8 @@ def cmd_peek(args):
     session_db.mark_delivered(db_path, [m["id"] for m in new_msgs])
 
     output = render_brief(brief_template, item_template, popups, msgs)
-    print(output)
+    print(output, file=sys.stderr)
+    sys.exit(2)
 
 
 # ── msgbox mark-done ────────────────────────────────────────

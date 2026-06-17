@@ -103,11 +103,15 @@ class TestCheckBackgroundTasks:
 
 
 class TestHookMain:
-    def _run(self, data: dict):
+    def _run(self, data: dict) -> tuple[str, str]:
+        """运行 main()，返回 (stdout, stderr)。"""
         old_stdin = sys.stdin
+        old_stdout = sys.stdout
         old_stderr = sys.stderr
         sys.stdin = StringIO(json.dumps(data))
+        stdout_out = StringIO()
         stderr_out = StringIO()
+        sys.stdout = stdout_out
         sys.stderr = stderr_out
         with (
             patch.object(check_bash, "BG_TRACKING_FILE", "/tmp/nonexistent-bg-test.json"),
@@ -118,63 +122,50 @@ class TestHookMain:
             except SystemExit:
                 pass
         sys.stdin = old_stdin
+        sys.stdout = old_stdout
         sys.stderr = old_stderr
-        return stderr_out.getvalue()
+        return stdout_out.getvalue(), stderr_out.getvalue()
 
     def test_non_bash_passthrough(self):
-        stderr = self._run({"tool_name": "Write", "tool_input": {}})
+        stdout, stderr = self._run({"tool_name": "Write", "tool_input": {}})
+        assert stdout == ""
         assert stderr == ""
 
     def test_background_passthrough(self):
-        stderr = self._run({
+        stdout, stderr = self._run({
             "tool_name": "Bash",
             "tool_input": {"command": "sleep 30", "run_in_background": True}
         })
+        assert stdout == ""
         assert stderr == ""
 
     def test_safe_command_passthrough(self):
-        stderr = self._run({
+        stdout, stderr = self._run({
             "tool_name": "Bash",
             "tool_input": {"command": "ls -la"}
         })
+        assert stdout == ""
         assert stderr == ""
 
-    def test_executed_command_blocked_with_result(self):
-        """hook 执行命令后应 block 并告知结果"""
-        with (
-            patch.object(check_bash, "execute_with_timeout",
-                         return_value=(0, "hello world", "")),
-            patch.object(check_bash, "BG_TRACKING_FILE", "/tmp/nonexistent-bg-test.json"),
-            patch.object(check_bash, "check_background_tasks"),
-        ):
-            stderr = self._run({
-                "tool_name": "Bash",
-                "tool_input": {"command": "printf hello"}
-            })
-            result = json.loads(stderr)
-            assert result["decision"] == "deny"
-            assert "already executed" in result["reason"]
+    def test_existing_timeout_passthrough(self):
+        """已有 timeout 的命令应直接放行"""
+        stdout, stderr = self._run({
+            "tool_name": "Bash",
+            "tool_input": {"command": "pip install flask", "timeout": 30000}
+        })
+        assert stdout == ""
+        assert stderr == ""
 
-    def test_timeout_deny(self):
-        """超时时应 block 并提示用 background"""
-        with patch.object(check_bash, "execute_with_timeout",
-                          return_value=(-1, "", "")):
-            stderr = self._run({
-                "tool_name": "Bash",
-                "tool_input": {"command": "sleep 100"}
-            })
-            result = json.loads(stderr)
-            assert result["decision"] == "deny"
-            assert "timed out" in result["reason"].lower()
-
-    def test_execute_timeout_real(self):
-        rc, _, _ = check_bash.execute_with_timeout("sleep 10", 3000)
-        assert rc == -1
-
-    def test_execute_ok_real(self):
-        rc, stdout, _ = check_bash.execute_with_timeout("echo hi", 5000)
-        assert rc == 0
-        assert "hi" in stdout
+    def test_no_timeout_adds_timeout(self):
+        """没有 timeout 的命令应自动加 60s timeout"""
+        stdout, stderr = self._run({
+            "tool_name": "Bash",
+            "tool_input": {"command": "pip install flask"}
+        })
+        result = json.loads(stdout)
+        assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
+        assert result["hookSpecificOutput"]["updatedInput"]["timeout"] == 60000
+        assert result["hookSpecificOutput"]["updatedInput"]["command"] == "pip install flask"
 
     def test_invalid_json_passthrough(self):
         old_stdin = sys.stdin

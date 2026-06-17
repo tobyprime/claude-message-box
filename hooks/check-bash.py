@@ -1,33 +1,30 @@
 #!/usr/bin/env python3
-"""PreToolUse hook: 接管 Bash 命令执行，带超时检测。
+"""PreToolUse hook: 为 Bash 命令自动添加 timeout，防止卡死。
 
 协议：
-  exit 0 → 放行（Claude 执行工具）
-  exit 2 + stderr JSON → 拒绝，Claude 看到 reason 后调整
+  输出到 stdout JSON：
+    {"hookSpecificOutput": {"permissionDecision": "allow|deny", "updatedInput": {...}}}
 
 逻辑：
-1. 非 Bash / 已 background → exit 0 放行
-2. 安全命令 → exit 0 放行（Claude 执行）
-3. 否则 → hook 自己执行命令，设超时（工具 timeout 或默认 60s）
-   - 超时 → exit 2 提示转 background
-   - 完成 → exit 2 告知 Claude 命令已执行（不重跑）
-4. 后台任务跟踪，超过 10 分钟发通知
+1. 非 Bash → 放行
+2. 已有 run_in_background → 放行，记录跟踪
+3. 已有合理的 timeout → 放行
+4. 安全命令 → 放行
+5. 否则 → 在 updatedInput 中添加 timeout: 60000（60s），然后放行
+   这样如果命令超时，Claude 会看到超时错误，自然知道该用 background
+6. 后台任务 > 10 分钟 → 通知
 """
 
 import json
 import os
 import re
-import signal
-import subprocess
 import sys
-import threading
 import time
 
 BG_TRACKING_FILE = os.path.expanduser(
     "~/.claude/plugins/message-box/background_tasks.json"
 )
 
-# 安全命令（直接放行，不经过 hook 执行）
 SAFE_PATTERN = re.compile(
     r'^(ls\b|pwd\b|echo\b|date\b|whoami\b|which\b|cat\b|head\b|tail\b|grep\b|find\b|'
     r'cd\b|mkdir\b|cp\b|mv\b|rm\b|diff\b|cmp\b|stat\b|du\b|df\b|wc\b|sort\b|uniq\b|'
@@ -37,50 +34,56 @@ SAFE_PATTERN = re.compile(
 )
 
 
-def check_background_tasks():
-    """检查后台任务，超过 10 分钟未完成的发通知。"""
+def _load_tasks() -> dict:
     if not os.path.exists(BG_TRACKING_FILE):
-        return
+        return {}
     try:
         with open(BG_TRACKING_FILE) as f:
-            tasks = json.load(f)
+            return json.load(f)
     except (json.JSONDecodeError, OSError):
-        return
+        return {}
 
+
+def _save_tasks(tasks: dict):
+    os.makedirs(os.path.dirname(BG_TRACKING_FILE), exist_ok=True)
+    with open(BG_TRACKING_FILE, "w") as f:
+        json.dump(tasks, f)
+
+
+def check_background_tasks():
+    tasks = _load_tasks()
     now = time.time()
-    stale_notified = []
     remaining = {}
+    notified = []
 
     for key, task in tasks.items():
         elapsed = now - task.get("started_at", 0)
         if elapsed > 600 and not task.get("notified", False):
             task["notified"] = True
-            stale_notified.append(task)
+            notified.append(task)
         if elapsed <= 3600:
             remaining[key] = task
 
-    with open(BG_TRACKING_FILE, "w") as f:
-        json.dump(remaining, f)
+    _save_tasks(remaining)
 
-    if stale_notified:
-        for task in stale_notified:
+    if notified:
+        for task in notified:
             result = {
-                "decision": "deny",
-                "reason": f"Background task running for over 10 minutes: {task.get('command', 'unknown')[:100]}",
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        f"Background task running for over 10 minutes: "
+                        f"{task.get('command', 'unknown')[:100]}"
+                    ),
+                }
             }
-            print(json.dumps(result), file=sys.stderr)
-            sys.exit(2)
+            print(json.dumps(result))
+            sys.exit(0)
 
 
 def track_background(command: str):
-    """记录 background 任务用于超时监控。"""
-    tasks = {}
-    if os.path.exists(BG_TRACKING_FILE):
-        try:
-            with open(BG_TRACKING_FILE) as f:
-                tasks = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            tasks = {}
+    tasks = _load_tasks()
     key = str(int(time.time() * 1000))
     while key in tasks:
         key += "_"
@@ -89,36 +92,7 @@ def track_background(command: str):
         "started_at": time.time(),
         "notified": False,
     }
-    os.makedirs(os.path.dirname(BG_TRACKING_FILE), exist_ok=True)
-    with open(BG_TRACKING_FILE, "w") as f:
-        json.dump(tasks, f)
-
-
-def execute_with_timeout(command: str, timeout_ms: int) -> tuple[int, str, str]:
-    """执行命令，超时则 kill。返回 (rc, stdout, stderr)。"""
-    proc = subprocess.Popen(
-        ["bash", "-c", command],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        preexec_fn=lambda: signal.signal(signal.SIGTERM, lambda *_: os._exit(1)),
-    )
-
-    timed_out = [False]
-
-    def kill_proc():
-        timed_out[0] = True
-        try:
-            proc.kill()
-        except OSError:
-            pass
-
-    timer = threading.Timer(timeout_ms / 1000.0, kill_proc)
-    timer.start()
-    stdout, stderr = proc.communicate()
-    timer.cancel()
-
-    rc = -1 if timed_out[0] else proc.returncode
-    return rc, stdout.decode("utf-8", errors="replace").strip(), stderr.decode("utf-8", errors="replace").strip()
+    _save_tasks(tasks)
 
 
 def main():
@@ -135,42 +109,39 @@ def main():
     timeout = tool_input.get("timeout")
     run_bg = tool_input.get("run_in_background", False)
 
+    # 非 Bash → 放行
     if data.get("tool_name") != "Bash":
         sys.exit(0)
 
+    # 已 background → 放行（记录跟踪）
     if run_bg:
         track_background(command)
         sys.exit(0)
 
+    # 已有 timeout → 放行
+    if timeout is not None:
+        sys.exit(0)
+
+    # 安全命令 → 放行
     if SAFE_PATTERN.match(command.strip()):
         sys.exit(0)
 
-    # 执行命令，检测超时
-    timeout_ms = timeout if timeout and isinstance(timeout, (int, float)) and timeout > 0 else 60000
-    rc, stdout, stderr = execute_with_timeout(command, timeout_ms)
-
-    if rc == -1:
-        # 超时 → block，提示用 background
-        result = {
-            "decision": "deny",
-            "reason": f"Command timed out after {timeout_ms // 1000}s. Re-run with `run_in_background: true` so it doesn't block.",
-        }
-        print(json.dumps(result), file=sys.stderr)
-        sys.exit(2)
-
-    # 执行完毕 → block，告知 Claude 结果（避免重跑）
-    msg = f"Command already executed (exit={rc})"
-    if stdout:
-        msg += f"\nstdout:\n{stdout[:2000]}"
-    if stderr:
-        msg += f"\nstderr:\n{stderr[:2000]}"
+    # 其他命令 → 自动加 timeout
+    updated = dict(tool_input)
+    updated["timeout"] = 60000
+    if "description" not in updated:
+        updated["description"] = f"Auto-added 60s timeout to prevent blocking"
 
     result = {
-        "decision": "deny",
-        "reason": msg,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": "Added 60s timeout to prevent blocking. If it times out, retry with run_in_background: true.",
+            "updatedInput": updated,
+        }
     }
-    print(json.dumps(result), file=sys.stderr)
-    sys.exit(2)
+    print(json.dumps(result))
+    sys.exit(0)
 
 
 if __name__ == "__main__":

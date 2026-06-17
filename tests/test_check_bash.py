@@ -100,11 +100,8 @@ class TestCheckBackgroundTasks:
             os.unlink(path)
 
     def test_notify_stale(self, old_tasks):
-        with patch.object(check_bash, "sys", exit=lambda x: (_ for _ in ()).throw(SystemExit(x))):
-            try:
-                check_bash.check_background_tasks()
-            except SystemExit:
-                pass
+        with pytest.raises(SystemExit):
+            check_bash.check_background_tasks()
 
     def test_recent_no_notify(self):
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
@@ -114,7 +111,7 @@ class TestCheckBackgroundTasks:
                 "1": {"command": "pip install", "started_at": time.time(), "notified": False}
             }
             check_bash._save_tasks(tasks)
-            check_bash.check_background_tasks()  # should not raise
+            check_bash.check_background_tasks()
         if os.path.exists(path):
             os.unlink(path)
 
@@ -127,10 +124,14 @@ class TestHookMain:
         sys.stdin = StringIO(json.dumps(data))
         stderr_out = StringIO()
         sys.stderr = stderr_out
-        try:
-            check_bash.main()
-        except SystemExit:
-            pass
+        with (
+            patch.object(check_bash, "BG_TRACKING_FILE", "/tmp/nonexistent-bg-test.json"),
+            patch.object(check_bash, "check_background_tasks"),
+        ):
+            try:
+                check_bash.main()
+            except SystemExit:
+                pass
         sys.stdin = old_stdin
         sys.stderr = old_stderr
         return stderr_out.getvalue()
@@ -180,8 +181,12 @@ class TestHookMain:
     def test_invalid_json_passthrough(self):
         old_stdin = sys.stdin
         sys.stdin = StringIO("not json")
-        try:
-            check_bash.main()
-        except SystemExit:
-            pass
+        with (
+            patch.object(check_bash, "BG_TRACKING_FILE", "/tmp/nonexistent-bg-test.json"),
+            patch.object(check_bash, "check_background_tasks"),
+        ):
+            try:
+                check_bash.main()
+            except SystemExit:
+                pass
         sys.stdin = old_stdin

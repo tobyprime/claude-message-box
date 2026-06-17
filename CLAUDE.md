@@ -73,11 +73,11 @@ msgbox config remove-rule <type> <index>  # 删除规则
 ### 架构
 
 ```
-GitHub → smee.io → smee-client → localhost:3001/webhook → classify → msgbox DB → hooks → 会话
+GitHub → smee.io → msgbox source-github (内置 SSE) → classify → msgbox DB → hooks → 会话
 ```
 
 ### 注意事项
 
 - 用 `gh api graphql` 回复 GitHub Discussion（REST API 对 discussion 支持不全）
-- 回复后自己的 webhook 会回到 msgbox，但被 `ignore sender=tobylinas2` 过滤
-- smee-client 需要代理才能连接外网
+- 回复后自己的 webhook 会回到 msgbox，但在 handler 层被自用户过滤
+- msgbox source-github 内置 SSE 客户端，需通过代理连接外网

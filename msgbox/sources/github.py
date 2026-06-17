@@ -138,18 +138,18 @@ def _map_issues(event_type: str, payload: dict, repo: str, sender: str) -> dict 
     }
 
 
-def _map_issue_comment(event_type: str, payload: dict, repo: str, sender: str) -> dict | None:
-    issue = payload.get("issue", {})
+def _map_comment(event_type: str, event_label: str, parent_label: str, parent: dict, payload: dict, repo: str, sender: str) -> dict | None:
+    """共享的 issue_comment / discussion_comment 映射逻辑"""
     comment = payload.get("comment", {})
-    number = issue.get("number", "?")
+    number = parent.get("number", "?")
     body = (comment.get("body") or "")[:300]
     url = comment.get("html_url", "")
     mentions = re.findall(r"@([\w-]+)", body)
 
     return {
-        "type": "github.issue_comment",
-        "title": f"Comment on #{number}",
-        "content": f"{sender} commented on #{number} in {repo}\n{body}",
+        "type": event_type,
+        "title": f"{parent_label} on #{number}",
+        "content": f"{sender} {event_label} on #{number} in {repo}\n{body}",
         "props": {
             "repo": repo,
             "number": str(number),
@@ -157,9 +157,16 @@ def _map_issue_comment(event_type: str, payload: dict, repo: str, sender: str) -
             "sender": sender,
             "url": url,
             "mentions": ",".join(mentions),
-            "event": "issue_comment",
+            "event": event_type.split(".")[-1],
         },
     }
+
+
+def _map_issue_comment(event_type: str, payload: dict, repo: str, sender: str) -> dict | None:
+    return _map_comment(
+        "github.issue_comment", "commented", "Comment",
+        payload.get("issue", {}), payload, repo, sender,
+    )
 
 
 def _map_pull_request(event_type: str, payload: dict, repo: str, sender: str) -> dict | None:
@@ -381,27 +388,10 @@ def _map_discussion(event_type: str, payload: dict, repo: str, sender: str) -> d
 
 
 def _map_discussion_comment(event_type: str, payload: dict, repo: str, sender: str) -> dict | None:
-    discussion = payload.get("discussion", {})
-    comment = payload.get("comment", {})
-    number = discussion.get("number", "?")
-    body = (comment.get("body") or "")[:300]
-    url = comment.get("html_url", "")
-    mentions = re.findall(r"@([\w-]+)", body)
-
-    return {
-        "type": "github.discussion_comment",
-        "title": f"Discussion comment on #{number}",
-        "content": f"{sender} commented on discussion #{number} in {repo}\n{body}",
-        "props": {
-            "repo": repo,
-            "number": str(number),
-            "action": payload.get("action", ""),
-            "sender": sender,
-            "url": url,
-            "mentions": ",".join(mentions),
-            "event": "discussion_comment",
-        },
-    }
+    return _map_comment(
+        "github.discussion_comment", "commented on discussion", "Discussion comment",
+        payload.get("discussion", {}), payload, repo, sender,
+    )
 
 
 def _map_ping(event_type: str, payload: dict, repo: str, sender: str) -> dict | None:
@@ -467,6 +457,7 @@ def _sse_listen(smee_url: str, target_url: str, stop_event: threading.Event, pro
                 sock.settimeout(60)
 
             buffer = ""
+            pos = 0
             last_event_time = time.time()
             while not stop_event.is_set():
                 try:
@@ -484,10 +475,18 @@ def _sse_listen(smee_url: str, target_url: str, stop_event: threading.Event, pro
                 if not chunk:
                     break
                 buffer += chunk.decode("utf-8", errors="replace")
-                while "\n\n" in buffer:
-                    event_block, buffer = buffer.split("\n\n", 1)
+                while True:
+                    delim = buffer.find("\n\n", pos)
+                    if delim == -1:
+                        break
+                    event_block = buffer[pos:delim]
+                    pos = delim + 2
                     last_event_time = time.time()
                     _handle_sse_event(event_block, target_url)
+                # Trim consumed portion to prevent unbounded growth
+                if pos > 8192:
+                    buffer = buffer[pos:]
+                    pos = 0
 
         except Exception as exc:
             if stop_event.is_set():
@@ -575,11 +574,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logger.info(f"{self.client_address[0]} - {format % args}")
 
+    def _respond(self, status: int, body: bytes):
+        """快捷响应：设置状态码、headers 并写入 body。"""
+        self.send_response(status)
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
         if self.path != "/webhook":
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b'{"error":"not found"}\n')
+            self._respond(404, b'{"error":"not found"}\n')
             return
 
         content_length = int(self.headers.get("Content-Length", 0))
@@ -592,9 +595,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             payload = json.loads(body)
         except json.JSONDecodeError:
             logger.warning(f"Invalid JSON body for {event_type} (delivery={delivery_id})")
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b'{"error":"invalid json"}\n')
+            self._respond(400, b'{"error":"invalid json"}\n')
             return
 
         # ── Filtering ──────────────────────────────────────
@@ -604,31 +605,23 @@ class WebhookHandler(BaseHTTPRequestHandler):
         # Hard-ignore own events (bypasses all rule-based filtering)
         if self.self_user and sender == self.self_user:
             logger.debug(f"Ignored own event: {event_type} from {sender}")
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'{"status":"ignored (self)"}\n')
+            self._respond(200, b'{"status":"ignored (self)"}\n')
             return
 
         if self.repo_filter and repo_name not in self.repo_filter:
             logger.debug(f"Skipped {event_type} from {repo_name} (repo not in allowlist)")
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'{"status":"skipped (repo filter)"}\n')
+            self._respond(200, b'{"status":"skipped (repo filter)"}\n')
             return
 
         if self.event_filter and event_type not in self.event_filter:
             logger.debug(f"Skipped {event_type} from {repo_name} (event not in allowlist)")
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'{"status":"skipped (event filter)"}\n')
+            self._respond(200, b'{"status":"skipped (event filter)"}\n')
             return
 
         # ── Map to message ─────────────────────────────────
         msg = map_github_event(event_type, payload)
         if msg is None:
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'{"status":"skipped (no mapping)"}\n')
+            self._respond(200, b'{"status":"skipped (no mapping)"}\n')
             return
 
         # ── Map and insert ─────────────────────────────────
@@ -645,50 +638,21 @@ class WebhookHandler(BaseHTTPRequestHandler):
             logger.info(f"Stored #{msg_id}: [{msg['type']}] {msg['title']}")
         except Exception as exc:
             logger.error(f"Failed to store message: {exc}")
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(b'{"error":"db insert failed"}\n')
+            self._respond(500, b'{"error":"db insert failed"}\n')
             return
 
-        self.send_response(201)
-        self.end_headers()
-        self.wfile.write(json.dumps({"status": "ok", "id": msg_id}).encode())
+        self._respond(201, json.dumps({"status": "ok", "id": msg_id}).encode())
 
     def do_GET(self):
         if self.path == "/health":
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'{"status":"ok"}\n')
+            self._respond(200, b'{"status":"ok"}\n')
         elif self.path == "/webhook":
-            # Respond to smee-client pre-flight / info requests
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'{"status":"github webhook endpoint ready"}\n')
+            self._respond(200, b'{"status":"github webhook endpoint ready"}\n')
         else:
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b'{"error":"not found"}\n')
+            self._respond(404, b'{"error":"not found"}\n')
 
 
 # ── Server lifecycle ───────────────────────────────────────────
-
-
-def _make_handler(
-    event_filter: set[str] | None,
-    repo_filter: list[str] | None,
-    started_event: threading.Event,
-    self_user: str = "",
-):
-    """Factory to create a WebhookHandler subclass with injected config."""
-
-    class ConfiguredHandler(WebhookHandler):
-        pass
-
-    ConfiguredHandler.event_filter = event_filter
-    ConfiguredHandler.repo_filter = repo_filter
-    ConfiguredHandler.self_user = self_user
-    ConfiguredHandler.server_started = started_event
-    return ConfiguredHandler
 
 
 def run_server(
@@ -715,9 +679,14 @@ def run_server(
         event_filter = set(events)
 
     started = threading.Event()
-    handler = _make_handler(event_filter, repos, started, self_user)
 
-    server = HTTPServer(("127.0.0.1", port), handler)
+    # Inject config into handler class (single server per process, so direct assignment is safe)
+    WebhookHandler.event_filter = event_filter
+    WebhookHandler.repo_filter = repos
+    WebhookHandler.self_user = self_user
+    WebhookHandler.server_started = started
+
+    server = HTTPServer(("127.0.0.1", port), WebhookHandler)
     logger.info(f"GitHub source listening on http://127.0.0.1:{port}/webhook")
 
     if smee_url:

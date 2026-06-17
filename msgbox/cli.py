@@ -107,7 +107,7 @@ def cmd_wait(args):
     idle_duration = config.IDLE_DURATION
     sleep_duration = config.SLEEP_DURATION
 
-    # Phase 1: 检查 popup
+    # Phase 1: 检查 popup（立即返回）
     popup_count = central_db.get_unread_popup_count(config.CENTRAL_DB, excluded_ids)
     if popup_count > 0:
         popups = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("popup",))
@@ -116,23 +116,9 @@ def cmd_wait(args):
         print(output)
         return
 
-    # Phase 2: IdleDuration 轮询
+    # Phase 2+3: 单循环轮询（先 idle 区间，后 sleep 区间）
     elapsed = 0
     poll_interval = 5
-    while elapsed < idle_duration:
-        time.sleep(poll_interval)
-        elapsed += poll_interval
-        excluded_ids = session_db.get_excluded_ids(db_path)
-        normals = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("popup", "normal"))
-        if normals:
-            popups = [m for m in normals if m["category"] == "popup"]
-            msgs = [m for m in normals if m["category"] == "normal"]
-            session_db.mark_delivered(db_path, [m["id"] for m in normals])
-            output = render_brief(brief_template, item_template, popups, msgs)
-            print(output)
-            return
-
-    # Phase 3: SleepDuration 轮询
     while elapsed < sleep_duration:
         time.sleep(poll_interval)
         elapsed += poll_interval
@@ -293,30 +279,31 @@ def cmd_config_rules_remove(args):
 # ── msgbox source-github ─────────────────────────────────────
 
 
+_THREAD_TYPE_PATTERNS = {
+    "discussion": ("github.discussion_comment",),
+    "issue": ("github.issue_comment",),
+    "pr": ("github.review_comment", "github.review"),
+}
+
+
 def cmd_subscribe(args):
     """Subscribe to notifications for a specific thread (discussion/issue)."""
     thread_type = args.thread_type
     number = args.number
-    popup = args.popup
 
-    if thread_type == "discussion":
-        ignore_pattern = "github.discussion_comment"
-        props = {"number": str(number)}
-    elif thread_type == "issue":
-        ignore_pattern = "github.issue_comment"
-        props = {"number": str(number)}
-    elif thread_type == "pr":
-        ignore_pattern = "github.review_comment|github.review"
-        props = {"number": str(number)}
-    else:
+    patterns = _THREAD_TYPE_PATTERNS.get(thread_type)
+    if patterns is None:
         print(f"Unknown type: {thread_type}", file=sys.stderr)
         sys.exit(1)
+
+    ignore_pattern = "|".join(patterns)
+    props = {"number": str(number)}
 
     # Add silent_excluded to bypass the default silent rule for this thread
     add_rule("silent_excluded", ignore_pattern, props)
     print(f"Subscribed to {thread_type} #{number} comments (silent_excluded)")
 
-    if popup:
+    if args.popup:
         # Also add popup rule for comments on this thread
         add_rule("popup", ignore_pattern, props)
         print(f"  → {thread_type} #{number} comments will be popup")
@@ -327,13 +314,8 @@ def cmd_unsubscribe(args):
     thread_type = args.thread_type
     number = args.number
 
-    if thread_type == "discussion":
-        patterns = ["github.discussion_comment"]
-    elif thread_type == "issue":
-        patterns = ["github.issue_comment"]
-    elif thread_type == "pr":
-        patterns = ["github.review_comment", "github.review"]
-    else:
+    patterns = _THREAD_TYPE_PATTERNS.get(thread_type)
+    if patterns is None:
         print(f"Unknown type: {thread_type}", file=sys.stderr)
         sys.exit(1)
 
@@ -393,7 +375,7 @@ def cmd_source_github(args):
     except Exception:
         self_user = ""
 
-    if not repos and not args.repos:
+    if not repos:
         repos = None
     if not events:
         events = None

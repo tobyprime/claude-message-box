@@ -3,8 +3,7 @@
 分类结果:
   - popup  : 弹窗消息，立即打断
   - normal : 普通消息，空闲时显示
-  - silent : 静默消息，长时间空闲才显示
-  - ignore : 忽略消息，不入库
+  - silent : 静默消息，存库但不展示
 """
 
 import re
@@ -14,20 +13,11 @@ from .yaml_config import load_config
 
 
 def classify_message(type_: str, props: dict[str, str]) -> str:
-    """按规则分类消息: popup / silent / normal / ignore"""
+    """按规则分类消息: popup / silent / normal"""
     cfg = load_config()
     rules = cfg.get("rules", {})
 
     ctx = {"type": type_, "props": props}
-
-    # 0. ignore_excluded — 命中则跳过 ignore
-    for rule in rules.get("ignore_excluded", []):
-        if _match_rule(rule, ctx):
-            break
-    else:
-        for rule in rules.get("ignore", []):
-            if _match_rule(rule, ctx):
-                return "ignore"
 
     # 1. popup_excluded — 命中则跳过 popup
     for rule in rules.get("popup_excluded", []):

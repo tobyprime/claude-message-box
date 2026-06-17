@@ -112,7 +112,7 @@ def cmd_wait(args):
     if popup_count > 0:
         popups = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("popup",))
         session_db.mark_delivered(db_path, [m["id"] for m in popups])
-        output = render_brief(brief_template, item_template, popups, [], [])
+        output = render_brief(brief_template, item_template, popups, [])
         print(output)
         return
 
@@ -128,7 +128,7 @@ def cmd_wait(args):
             popups = [m for m in normals if m["category"] == "popup"]
             msgs = [m for m in normals if m["category"] == "normal"]
             session_db.mark_delivered(db_path, [m["id"] for m in normals])
-            output = render_brief(brief_template, item_template, popups, msgs, [])
+            output = render_brief(brief_template, item_template, popups, msgs)
             print(output)
             return
 
@@ -137,13 +137,12 @@ def cmd_wait(args):
         time.sleep(poll_interval)
         elapsed += poll_interval
         excluded_ids = session_db.get_excluded_ids(db_path)
-        new_msgs = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("popup", "normal", "silent"))
-        if new_msgs:
-            popups = [m for m in new_msgs if m["category"] == "popup"]
-            msgs = [m for m in new_msgs if m["category"] == "normal"]
-            silents = [m for m in new_msgs if m["category"] == "silent"]
-            session_db.mark_delivered(db_path, [m["id"] for m in new_msgs])
-            output = render_brief(brief_template, item_template, popups, msgs, silents)
+        normals = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("popup", "normal"))
+        if normals:
+            popups = [m for m in normals if m["category"] == "popup"]
+            msgs = [m for m in normals if m["category"] == "normal"]
+            session_db.mark_delivered(db_path, [m["id"] for m in normals])
+            output = render_brief(brief_template, item_template, popups, msgs)
             print(output)
             return
 
@@ -196,18 +195,17 @@ def cmd_peek(args):
     item_template = templates.get("item", "")
 
     excluded_ids = session_db.get_excluded_ids(db_path)
-    new_msgs = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("popup", "normal", "silent"))
+    new_msgs = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("popup", "normal"))
 
     if not new_msgs:
         return
 
     popups = [m for m in new_msgs if m["category"] == "popup"]
     msgs = [m for m in new_msgs if m["category"] == "normal"]
-    silents = [m for m in new_msgs if m["category"] == "silent"]
 
     session_db.mark_delivered(db_path, [m["id"] for m in new_msgs])
 
-    output = render_brief(brief_template, item_template, popups, msgs, silents)
+    output = render_brief(brief_template, item_template, popups, msgs)
     print(output)
 
 
@@ -314,9 +312,9 @@ def cmd_subscribe(args):
         print(f"Unknown type: {thread_type}", file=sys.stderr)
         sys.exit(1)
 
-    # Add ignore_excluded to bypass the default ignore rule for this thread
-    add_rule("ignore_excluded", ignore_pattern, props)
-    print(f"Subscribed to {thread_type} #{number} comments (ignore_excluded)")
+    # Add silent_excluded to bypass the default silent rule for this thread
+    add_rule("silent_excluded", ignore_pattern, props)
+    print(f"Subscribed to {thread_type} #{number} comments (silent_excluded)")
 
     if popup:
         # Also add popup rule for comments on this thread
@@ -343,7 +341,7 @@ def cmd_unsubscribe(args):
     cfg = load_config()
     removed = 0
 
-    for rule_type in ("ignore_excluded", "popup"):
+    for rule_type in ("silent_excluded", "popup"):
         rules = cfg.get("rules", {}).get(rule_type, [])
         to_remove = []
         for i, rule in enumerate(rules):
@@ -361,7 +359,7 @@ def cmd_subscriptions(args):
     rules = list_rules()
     subs = []
     for r in rules:
-        if r["type"] in ("ignore_excluded", "popup"):
+        if r["type"] in ("silent_excluded", "popup"):
             props = r.get("props", {})
             if "number" in props:
                 subs.append(r)
@@ -492,13 +490,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_config_rules)
 
     sp = csub.add_parser("add-rule", help="Add filter rule")
-    sp.add_argument("rule_type", choices=["popup", "popup_excluded", "silent", "silent_excluded", "ignore", "ignore_excluded"])
+    sp.add_argument("rule_type", choices=["popup", "popup_excluded", "silent", "silent_excluded"])
     sp.add_argument("pattern", help="Regex pattern for message type")
     sp.add_argument("--props", help='JSON props filters, e.g. \'{"repo":"my-project"}\'')
     sp.set_defaults(func=cmd_config_rules_add)
 
     sp = csub.add_parser("remove-rule", help="Remove filter rule by index")
-    sp.add_argument("rule_type", choices=["popup", "popup_excluded", "silent", "silent_excluded", "ignore", "ignore_excluded"])
+    sp.add_argument("rule_type", choices=["popup", "popup_excluded", "silent", "silent_excluded"])
     sp.add_argument("index", type=int)
     sp.set_defaults(func=cmd_config_rules_remove)
 

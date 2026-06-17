@@ -492,16 +492,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"status":"skipped (no mapping)"}\n')
             return
 
-        # ── Insert into central DB ─────────────────────────
+        # ── Map and insert ─────────────────────────────────
         try:
             category = classify_message(msg["type"], msg.get("props", {}))
-            if category == "ignore":
-                logger.debug(f"Ignored #{msg['type']}: {msg['title']}")
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b'{"status":"ignored"}\n')
-                return
-
             msg_id = central_db.insert_message(
                 config.CENTRAL_DB,
                 type_=msg["type"],

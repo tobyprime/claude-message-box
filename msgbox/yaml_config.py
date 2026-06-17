@@ -31,8 +31,6 @@ def save_config(cfg: dict[str, Any]):
 def _default_config() -> dict[str, Any]:
     return {
         "rules": {
-            "ignore": [],
-            "ignore_excluded": [],
             "popup": [],
             "popup_excluded": [],
             "silent": [],
@@ -45,9 +43,6 @@ def _default_config() -> dict[str, Any]:
 
 新消息 ({MESSAGE_COUNT}):
 {NEW_MESSAGES}
-
-静默消息 ({SILENT_MESSAGE_COUNT}):
-{NEW_SILENT_MESSAGES}
 
 !{date "+%Y-%m-%d %H:%M:%S"}
 """,
@@ -106,7 +101,7 @@ def remove_rule(rule_type: str, index: int):
 def list_rules() -> list[dict]:
     cfg = load_config()
     result = []
-    for rule_type in ("ignore", "ignore_excluded", "popup", "popup_excluded", "silent", "silent_excluded"):
+    for rule_type in ("popup", "popup_excluded", "silent", "silent_excluded"):
         for i, rule in enumerate(cfg.get("rules", {}).get(rule_type, [])):
             result.append({"index": i, "type": rule_type, "pattern": rule.get("type", ""), "props": rule.get("props", {})})
     return result

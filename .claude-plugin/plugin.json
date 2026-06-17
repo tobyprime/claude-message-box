@@ -1,0 +1,8 @@
+{
+  "name": "message-box",
+  "description": "Message Box - 消息队列插件，支持 popup/normal/silent 消息分类，通过 hooks 接管 Claude 会话输入",
+  "version": "0.1.0",
+  "author": {
+    "name": "toby"
+  }
+}

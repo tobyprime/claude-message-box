@@ -1,0 +1,21 @@
+services:
+  claude:
+    build: .
+    network_mode: host
+    image: claude-message-box
+    container_name: claude-mb
+    stdin_open: true
+    tty: true
+    environment:
+      - ANTHROPIC_AUTH_TOKEN=PROXY_MANAGED
+      - ANTHROPIC_BASE_URL=http://127.0.0.1:15721
+      - MESSAGE_BOX_IDLE_DURATION=300
+      - MESSAGE_BOX_SLEEP_DURATION=3600
+    volumes:
+      - claude-config:/root/.claude
+      - workspace:/workspace
+    working_dir: /workspace
+
+volumes:
+  claude-config:
+  workspace:

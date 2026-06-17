@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-message-box"
+version = "0.1.0"
+description = "Message Box plugin for Claude Code - message queue with popup/silent/normal classification"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+msgbox = "msgbox.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["msgbox*"]

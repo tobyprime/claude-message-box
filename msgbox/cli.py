@@ -1,11 +1,18 @@
 """CLI 入口 - msgbox 命令行工具"""
 
 import argparse
+import io
 import json
 import os
 import sys
 import time
 from pathlib import Path
+
+# 强制 stdout/stderr 使用 UTF-8 编码，避免中文乱码
+if sys.stdout.encoding and sys.stdout.encoding.upper() not in ("UTF-8", "UTF8"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+if sys.stderr.encoding and sys.stderr.encoding.upper() not in ("UTF-8", "UTF8"):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
 from . import config
 from . import db as central_db

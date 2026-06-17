@@ -398,12 +398,16 @@ def cmd_source_github(args):
     if not events:
         events = None
 
+    # Detect proxy from environment
+    proxy = os.environ.get("HTTP_PROXY") or os.environ.get("https_proxy") or ""
+
     run_server(
         port=port,
         smee_url=smee_url,
         repos=repos,
         events=events,
         self_user=self_user,
+        proxy=proxy,
         foreground=foreground,
     )
 

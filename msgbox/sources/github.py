@@ -13,6 +13,9 @@ import re
 import signal
 import sys
 import threading
+import time
+import urllib.error
+import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
@@ -421,6 +424,111 @@ def _map_generic(event_type: str, payload: dict, repo: str, sender: str) -> dict
     }
 
 
+# ── SSE Client (built-in smee-client replacement) ─────────────
+
+
+def _sse_listen(smee_url: str, target_url: str, stop_event: threading.Event, proxy: str = ""):
+    """Connect to smee.io SSE stream and forward events to the local server.
+
+    Runs in a background thread with auto-reconnect on failure.
+    """
+    import http.client
+    import urllib.parse
+
+    parsed = urllib.parse.urlparse(smee_url)
+    headers = {
+        "Accept": "text/event-stream",
+        "Cache-Control": "no-cache",
+    }
+    proxy_host = None
+    proxy_port = None
+    if proxy:
+        p = urllib.parse.urlparse(proxy)
+        proxy_host = p.hostname
+        proxy_port = p.port or 7890
+
+    while not stop_event.is_set():
+        conn = None
+        try:
+            logger.info(f"SSE: connecting to {smee_url} ...")
+            if proxy_host:
+                conn = http.client.HTTPSConnection(proxy_host, proxy_port, timeout=30)
+                conn.set_tunnel(parsed.hostname, parsed.port or 443)
+            else:
+                conn = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=30)
+            conn.request("GET", parsed.path or "/", headers=headers)
+            resp = conn.getresponse()
+            logger.info(f"SSE: connected (status={resp.status})")
+
+            buffer = ""
+            while not stop_event.is_set():
+                chunk = resp.read(4096)
+                if not chunk:
+                    break
+                buffer += chunk.decode("utf-8", errors="replace")
+                while "\n\n" in buffer:
+                    event_block, buffer = buffer.split("\n\n", 1)
+                    _handle_sse_event(event_block, target_url)
+
+        except Exception as exc:
+            if stop_event.is_set():
+                break
+            logger.warning(f"SSE: connection error: {exc}, reconnecting in 5s...")
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        if not stop_event.is_set():
+            stop_event.wait(5)
+
+
+def _handle_sse_event(event_block: str, target_url: str):
+    """Parse a single SSE event block and POST it to the local webhook server."""
+    data_lines = []
+
+    for line in event_block.strip().split("\n"):
+        if line.startswith("data:"):
+            data_lines.append(line[5:].strip())
+
+    if not data_lines:
+        return
+
+    data = "\n".join(data_lines)
+
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        return
+
+    gh_event = payload.get("x-github-event", "push")
+    delivery = payload.get("x-github-delivery", "")
+
+    if gh_event == "ping":
+        logger.info("SSE: received ping from smee.io")
+        return
+
+    # POST to local webhook handler
+    body_bytes = json.dumps(payload.get("body", {})).encode()
+    req = urllib.request.Request(
+        target_url,
+        data=body_bytes,
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": gh_event,
+            "X-GitHub-Delivery": delivery or "",
+        },
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        logger.debug(f"SSE: forwarded {gh_event}")
+    except Exception as exc:
+        logger.warning(f"SSE: failed to forward event {gh_event}: {exc}")
+
+
 # ── HTTP Server ────────────────────────────────────────────────
 
 
@@ -558,6 +666,7 @@ def run_server(
     repos: list[str] | None = None,
     events: list[str] | None = None,
     self_user: str = "",
+    proxy: str = "",
     foreground: bool = True,
 ) -> HTTPServer:
     """Start the GitHub webhook HTTP server.
@@ -582,7 +691,16 @@ def run_server(
 
     if smee_url:
         logger.info(f"Smee proxy: {smee_url}")
-        logger.info(f"Run: smee-client --url {smee_url} --target http://127.0.0.1:{port}/webhook")
+        logger.info(f"Built-in SSE client enabled (no external smee-client needed)")
+        stop_event = threading.Event()
+        t = threading.Thread(
+            target=_sse_listen,
+            args=(smee_url, f"http://127.0.0.1:{port}/webhook", stop_event, proxy),
+            daemon=True,
+        )
+        t.start()
+    else:
+        logger.info("No smee URL configured — waiting for manual POSTs")
 
     if repos:
         logger.info(f"Repo allowlist: {repos}")

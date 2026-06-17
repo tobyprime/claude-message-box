@@ -30,20 +30,20 @@ msgbox/
 ### 运行中的服务
 
 - **msgbox source-github** — 监听 `127.0.0.1:3001/webhook`，接收 GitHub webhook
-- **smee-client** — 连接 `https://smee.io/kt2xnWX9XKQBxCPA`，转发 webhook 到本地
-- 代理：`HTTP_PROXY=http://127.0.0.1:7890`（smee-client 需要）
+  - 内置 SSE 客户端连接 `https://smee.io/kt2xnWX9XKQBxCPA`（自动重连）
+  - 无需外部 smee-client
+- 代理：`HTTP_PROXY=http://127.0.0.1:7890`
 
 ### 消息分类规则
 
 | 规则 | 匹配 | 效果 |
 |------|------|------|
-| ignore | `discussion_comment` | 所有讨论评论默认忽略 |
-| ignore | `issue_comment` | 所有 issue 评论默认忽略 |
-| ignore | `sender=tobylinas2` | 自己（bot）的所有事件忽略 |
-| ignore_excluded | `discussion_comment + number=N` | 订阅的讨论评论透出 |
-| ignore_excluded | `mentions=tobylinas2` | @提及自己的评论透出 |
-| ignore_excluded | `discussion_comment + sender=tobyprime` | tobyprime 的评论透出 |
-| ignore_excluded | `issue_comment + sender=tobyprime` | tobyprime 的 issue 评论透出 |
+| silent | `discussion_comment` | 评论默认静默（存库但不展示） |
+| silent | `issue_comment` | issue 评论默认静默 |
+| silent | `star/fork/ping/status/check_suite/push` | 高频率低价值事件静默 |
+| silent_excluded | `discussion_comment + number=N` | 订阅的讨论评论透出 → normal |
+| silent_excluded | `discussion_comment + sender=tobyprime` | tobyprime 评论透出 → normal |
+| silent_excluded | `issue_comment + sender=tobyprime` | tobyprime issue 评论透出 → normal |
 | popup | `discussion_comment + sender=tobyprime` | tobyprime 任何评论弹窗 |
 | popup | `issue_comment + sender=tobyprime` | tobyprime 任何 issue 评论弹窗 |
 | popup | `discussion_comment + mentions=tobylinas2` | @提及弹窗 |
@@ -54,7 +54,6 @@ msgbox/
 | popup | `release` | Release 弹窗 |
 | popup | `workflow_run + conclusion=failure` | CI 失败弹窗 |
 | popup | `check_run + conclusion=failure` | Check 失败弹窗 |
-| silent | `star/fork/ping/status/check_suite/push` | 高频率低价值事件静默 |
 
 ### 常用命令
 

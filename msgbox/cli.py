@@ -119,7 +119,8 @@ def cmd_wait(args):
     # Phase 2+3: 单循环轮询（先 idle 区间，后 sleep 区间）
     elapsed = 0
     poll_interval = 5
-    while elapsed < sleep_duration:
+    total_duration = idle_duration + sleep_duration
+    while elapsed < total_duration:
         time.sleep(poll_interval)
         elapsed += poll_interval
         excluded_ids = session_db.get_excluded_ids(db_path)
@@ -132,7 +133,8 @@ def cmd_wait(args):
             print(output)
             return
 
-    # 无消息 — exit 2 让 hooks 继续
+    # 无消息 — exit(2) 让 hook 推送给 Claude
+    print(f"Waited {total_duration}s, no new messages")
     sys.exit(2)
 
 

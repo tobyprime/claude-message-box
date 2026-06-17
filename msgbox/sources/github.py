@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import signal
+import socket
 import sys
 import threading
 import time
@@ -460,14 +461,32 @@ def _sse_listen(smee_url: str, target_url: str, stop_event: threading.Event, pro
             resp = conn.getresponse()
             logger.info(f"SSE: connected (status={resp.status})")
 
+            # Set socket timeout for keep-alive detection
+            sock = resp.fp.raw._sock if hasattr(resp.fp, 'raw') else None
+            if sock:
+                sock.settimeout(60)
+
             buffer = ""
+            last_event_time = time.time()
             while not stop_event.is_set():
-                chunk = resp.read(4096)
+                try:
+                    chunk = resp.read(4096)
+                except socket.timeout:
+                    # No data for 60s — heartbeat check: send a ping request
+                    elapsed = time.time() - last_event_time
+                    if elapsed > 120:
+                        logger.info(f"SSE: no data for {int(elapsed)}s, reconnecting...")
+                        break
+                    continue
+                except Exception:
+                    break
+
                 if not chunk:
                     break
                 buffer += chunk.decode("utf-8", errors="replace")
                 while "\n\n" in buffer:
                     event_block, buffer = buffer.split("\n\n", 1)
+                    last_event_time = time.time()
                     _handle_sse_event(event_block, target_url)
 
         except Exception as exc:
@@ -503,15 +522,25 @@ def _handle_sse_event(event_block: str, target_url: str):
     except json.JSONDecodeError:
         return
 
-    gh_event = payload.get("x-github-event", "push")
+    gh_event = payload.get("x-github-event", "")
     delivery = payload.get("x-github-delivery", "")
+
+    if not gh_event:
+        return
 
     if gh_event == "ping":
         logger.info("SSE: received ping from smee.io")
         return
 
+    # Extract the actual GitHub webhook body
+    body = payload.get("body", {})
+    repo = (body.get("repository") or {}).get("full_name", "unknown")
+    sender = (body.get("sender") or {}).get("login", "unknown")
+
+    logger.info(f"SSE: forwarding {gh_event} from {repo} (sender={sender})")
+
     # POST to local webhook handler
-    body_bytes = json.dumps(payload.get("body", {})).encode()
+    body_bytes = json.dumps(body).encode()
     req = urllib.request.Request(
         target_url,
         data=body_bytes,
@@ -524,7 +553,9 @@ def _handle_sse_event(event_block: str, target_url: str):
     )
     try:
         urllib.request.urlopen(req, timeout=10)
-        logger.debug(f"SSE: forwarded {gh_event}")
+        logger.debug(f"SSE: forwarded {gh_event} OK")
+    except urllib.error.HTTPError as exc:
+        logger.warning(f"SSE: forward {gh_event} returned {exc.code}")
     except Exception as exc:
         logger.warning(f"SSE: failed to forward event {gh_event}: {exc}")
 

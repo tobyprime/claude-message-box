@@ -5,6 +5,7 @@
         "hooks": [
           {
             "type": "command",
+            "timeout": 5000,
             "command": "bash -c 'output=$(msgbox peek 2>/dev/null); if [ -n \"$output\" ]; then echo \"$output\" >&2; exit 2; fi; exit 0'"
           }
         ]
@@ -15,6 +16,7 @@
         "hooks": [
           {
             "type": "command",
+            "timeout": 660000,
             "command": "bash -c 'output=$(msgbox wait 2>/dev/null); rc=$?; if [ $rc -eq 0 ] && [ -n \"$output\" ]; then echo \"$output\" >&2; exit 2; fi; exit 0'"
           }
         ]

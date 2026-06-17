@@ -87,17 +87,17 @@ def render_brief(
     item_template: str,
     popup_messages: list[dict],
     normal_messages: list[dict],
-    silent_messages: list[dict],
+    silent_messages: list[dict] | None = None,
 ) -> str:
     """渲染消息简报"""
     popup_items = [_format_single_message(m, item_template) for m in popup_messages]
     normal_items = [_format_single_message(m, item_template) for m in normal_messages]
-    silent_items = [_format_single_message(m, item_template) for m in silent_messages]
+    silent_items = [_format_single_message(m, item_template) for m in (silent_messages or [])]
 
     vars = {
         "POPUP_MESSAGE_COUNT": str(len(popup_messages)),
         "MESSAGE_COUNT": str(len(normal_messages)),
-        "SILENT_MESSAGE_COUNT": str(len(silent_messages)),
+        "SILENT_MESSAGE_COUNT": str(len(silent_messages or [])),
         "NEW_POPUP_MESSAGES": "\n".join(popup_items) if popup_items else "",
         "NEW_MESSAGES": "\n".join(normal_items) if normal_items else "",
         "NEW_SILENT_MESSAGES": "\n".join(silent_items) if silent_items else "",

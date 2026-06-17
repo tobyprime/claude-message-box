@@ -9,23 +9,40 @@ import yaml
 
 from . import config
 
+# load_config 缓存：mtime 不变时复用缓存结果
+_config_cache: dict[str, Any] | None = None
+_config_mtime: float = 0
+
 
 def _ensure_dir():
     config.PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_config() -> dict[str, Any]:
+    global _config_cache, _config_mtime
     _ensure_dir()
     if not config.CONFIG_FILE.exists():
+        _config_cache = None
         return _default_config()
+    try:
+        mtime = config.CONFIG_FILE.stat().st_mtime
+    except OSError:
+        mtime = 0
+    if _config_cache is not None and _config_mtime == mtime:
+        return _config_cache
     with open(config.CONFIG_FILE) as f:
-        return yaml.safe_load(f) or _default_config()
+        _config_cache = yaml.safe_load(f) or _default_config()
+        _config_mtime = mtime
+        return _config_cache
 
 
 def save_config(cfg: dict[str, Any]):
+    global _config_cache, _config_mtime
     _ensure_dir()
     with open(config.CONFIG_FILE, "w") as f:
         yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+    _config_cache = cfg
+    _config_mtime = config.CONFIG_FILE.stat().st_mtime
 
 
 def _default_config() -> dict[str, Any]:
@@ -43,9 +60,6 @@ def _default_config() -> dict[str, Any]:
 
 新消息 ({MESSAGE_COUNT}):
 {NEW_MESSAGES}
-
-静默消息 ({SILENT_MESSAGE_COUNT}):
-{NEW_SILENT_MESSAGES}
 
 !{date "+%Y-%m-%d %H:%M:%S"}
 """,

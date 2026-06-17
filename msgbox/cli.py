@@ -11,6 +11,7 @@ from . import config
 from . import db as central_db
 from . import session as session_db
 from .filter import classify_message
+from .sources.github import run_server, get_github_config
 from .template import render_brief
 from .yaml_config import add_rule, get_config_value, list_rules, load_config, remove_rule, set_config_value
 
@@ -106,19 +107,19 @@ def cmd_wait(args):
     idle_duration = config.IDLE_DURATION
     sleep_duration = config.SLEEP_DURATION
 
-    # Phase 1: 检查 popup
+    # Phase 1: 检查 popup（立即返回）
     popup_count = central_db.get_unread_popup_count(config.CENTRAL_DB, excluded_ids)
     if popup_count > 0:
         popups = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("popup",))
         session_db.mark_delivered(db_path, [m["id"] for m in popups])
-        output = render_brief(brief_template, item_template, popups, [], [])
+        output = render_brief(brief_template, item_template, popups, [])
         print(output)
         return
 
-    # Phase 2: IdleDuration 轮询
+    # Phase 2+3: 单循环轮询（先 idle 区间，后 sleep 区间）
     elapsed = 0
     poll_interval = 5
-    while elapsed < idle_duration:
+    while elapsed < sleep_duration:
         time.sleep(poll_interval)
         elapsed += poll_interval
         excluded_ids = session_db.get_excluded_ids(db_path)
@@ -127,22 +128,7 @@ def cmd_wait(args):
             popups = [m for m in normals if m["category"] == "popup"]
             msgs = [m for m in normals if m["category"] == "normal"]
             session_db.mark_delivered(db_path, [m["id"] for m in normals])
-            output = render_brief(brief_template, item_template, popups, msgs, [])
-            print(output)
-            return
-
-    # Phase 3: SleepDuration 轮询
-    while elapsed < sleep_duration:
-        time.sleep(poll_interval)
-        elapsed += poll_interval
-        excluded_ids = session_db.get_excluded_ids(db_path)
-        new_msgs = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("popup", "normal", "silent"))
-        if new_msgs:
-            popups = [m for m in new_msgs if m["category"] == "popup"]
-            msgs = [m for m in new_msgs if m["category"] == "normal"]
-            silents = [m for m in new_msgs if m["category"] == "silent"]
-            session_db.mark_delivered(db_path, [m["id"] for m in new_msgs])
-            output = render_brief(brief_template, item_template, popups, msgs, silents)
+            output = render_brief(brief_template, item_template, popups, msgs)
             print(output)
             return
 
@@ -195,18 +181,17 @@ def cmd_peek(args):
     item_template = templates.get("item", "")
 
     excluded_ids = session_db.get_excluded_ids(db_path)
-    new_msgs = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("popup", "normal", "silent"))
+    new_msgs = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("popup", "normal"))
 
     if not new_msgs:
         return
 
     popups = [m for m in new_msgs if m["category"] == "popup"]
     msgs = [m for m in new_msgs if m["category"] == "normal"]
-    silents = [m for m in new_msgs if m["category"] == "silent"]
 
     session_db.mark_delivered(db_path, [m["id"] for m in new_msgs])
 
-    output = render_brief(brief_template, item_template, popups, msgs, silents)
+    output = render_brief(brief_template, item_template, popups, msgs)
     print(output)
 
 
@@ -291,6 +276,124 @@ def cmd_config_rules_remove(args):
     print(f"Removed rule [{args.index}] from {args.rule_type}")
 
 
+# ── msgbox source-github ─────────────────────────────────────
+
+
+_THREAD_TYPE_PATTERNS = {
+    "discussion": ("github.discussion_comment",),
+    "issue": ("github.issue_comment",),
+    "pr": ("github.review_comment", "github.review"),
+}
+
+
+def cmd_subscribe(args):
+    """Subscribe to notifications for a specific thread (discussion/issue)."""
+    thread_type = args.thread_type
+    number = args.number
+
+    patterns = _THREAD_TYPE_PATTERNS.get(thread_type)
+    if patterns is None:
+        print(f"Unknown type: {thread_type}", file=sys.stderr)
+        sys.exit(1)
+
+    ignore_pattern = "|".join(patterns)
+    props = {"number": str(number)}
+
+    # Add silent_excluded to bypass the default silent rule for this thread
+    add_rule("silent_excluded", ignore_pattern, props)
+    print(f"Subscribed to {thread_type} #{number} comments (silent_excluded)")
+
+    if args.popup:
+        # Also add popup rule for comments on this thread
+        add_rule("popup", ignore_pattern, props)
+        print(f"  → {thread_type} #{number} comments will be popup")
+
+
+def cmd_unsubscribe(args):
+    """Unsubscribe by removing matching rules."""
+    thread_type = args.thread_type
+    number = args.number
+
+    patterns = _THREAD_TYPE_PATTERNS.get(thread_type)
+    if patterns is None:
+        print(f"Unknown type: {thread_type}", file=sys.stderr)
+        sys.exit(1)
+
+    props = {"number": str(number)}
+    cfg = load_config()
+    removed = 0
+
+    for rule_type in ("silent_excluded", "popup"):
+        rules = cfg.get("rules", {}).get(rule_type, [])
+        to_remove = []
+        for i, rule in enumerate(rules):
+            if rule.get("type") in patterns and rule.get("props", {}).get("number") == str(number):
+                to_remove.append(i)
+        for i in reversed(to_remove):
+            remove_rule(rule_type, i)
+            removed += 1
+
+    print(f"Unsubscribed from {thread_type} #{number} (removed {removed} rules)")
+
+
+def cmd_subscriptions(args):
+    """List active subscriptions."""
+    rules = list_rules()
+    subs = []
+    for r in rules:
+        if r["type"] in ("silent_excluded", "popup"):
+            props = r.get("props", {})
+            if "number" in props:
+                subs.append(r)
+    if not subs:
+        print("No active subscriptions")
+        return
+    print("Active subscriptions:")
+    for s in subs:
+        print(f"  [{s['type']}] {s['pattern']:35s} props={json.dumps(s['props'], ensure_ascii=False)}")
+
+
+def cmd_source_github(args):
+    """Start the GitHub webhook listener."""
+    gh_config = get_github_config()
+
+    port = args.port or gh_config.get("port", 3001)
+    smee_url = args.smee_url or gh_config.get("smee_url", "")
+    repos = args.repos or gh_config.get("repos", [])
+    events = args.events or gh_config.get("events", ["*"])
+    foreground = args.foreground
+
+    # Auto-detect bot's GitHub username from gh auth
+    import subprocess
+    try:
+        self_user = subprocess.run(
+            ["gh", "api", "user", "--jq", ".login"],
+            capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        if self_user:
+            print(f"Bot user detected: {self_user} (own events will be ignored)")
+    except Exception:
+        self_user = ""
+
+    if not repos:
+        repos = None
+    if not events:
+        events = None
+
+    # Detect proxy from environment
+    proxy = os.environ.get("HTTP_PROXY") or os.environ.get("https_proxy") or ""
+
+    run_server(
+        port=port,
+        smee_url=smee_url,
+        repos=repos,
+        events=events,
+        self_user=self_user,
+        proxy=proxy,
+        foreground=foreground,
+    )
+
+
 # ── msgbox list-sessions ────────────────────────────────────
 
 
@@ -334,6 +437,28 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--ids", help="Comma-separated message IDs")
     sp.add_argument("--all", action="store_true", help="Mark all delivered messages as done")
     sp.set_defaults(func=cmd_mark_done)
+
+    sp = sub.add_parser("source-github", help="Start GitHub webhook listener")
+    sp.add_argument("--port", "-p", type=int, help="HTTP listen port (default: 3001)")
+    sp.add_argument("--smee-url", help="Smee.io proxy URL")
+    sp.add_argument("--repos", nargs="*", help="Repo allowlist (e.g. owner/repo)")
+    sp.add_argument("--events", nargs="*", help="Event types to accept (e.g. push issues)")
+    sp.add_argument("--foreground", "-f", action="store_true", help="Run in foreground (default: daemon)")
+    sp.set_defaults(func=cmd_source_github)
+
+    sp = sub.add_parser("subscribe", help="Subscribe to thread notifications")
+    sp.add_argument("thread_type", choices=["discussion", "issue", "pr"])
+    sp.add_argument("number", type=int, help="Thread number")
+    sp.add_argument("--popup", action="store_true", help="Show as popup (default: normal)")
+    sp.set_defaults(func=cmd_subscribe)
+
+    sp = sub.add_parser("unsubscribe", help="Unsubscribe from thread notifications")
+    sp.add_argument("thread_type", choices=["discussion", "issue", "pr"])
+    sp.add_argument("number", type=int, help="Thread number")
+    sp.set_defaults(func=cmd_unsubscribe)
+
+    sp = sub.add_parser("subscriptions", help="List active subscriptions")
+    sp.set_defaults(func=cmd_subscriptions)
 
     cp = sub.add_parser("config", help="Manage configuration")
     csub = cp.add_subparsers(dest="config_cmd")

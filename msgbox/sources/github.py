@@ -7,6 +7,7 @@ Usage:
     msgbox source-github [--port PORT] [--smee-url URL]
 """
 
+import codecs
 import json
 import logging
 import re
@@ -456,6 +457,7 @@ def _sse_listen(smee_url: str, target_url: str, stop_event: threading.Event, pro
             if sock:
                 sock.settimeout(60)
 
+            decoder = codecs.getincrementaldecoder("utf-8")()
             buffer = ""
             pos = 0
             last_event_time = time.time()
@@ -474,7 +476,7 @@ def _sse_listen(smee_url: str, target_url: str, stop_event: threading.Event, pro
 
                 if not chunk:
                     break
-                buffer += chunk.decode("utf-8", errors="replace")
+                buffer += decoder.decode(chunk)
                 while True:
                     delim = buffer.find("\n\n", pos)
                     if delim == -1:

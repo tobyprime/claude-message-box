@@ -11,6 +11,7 @@ from . import config
 from . import db as central_db
 from . import session as session_db
 from .filter import classify_message
+from .sources.github import run_server, get_github_config
 from .template import render_brief
 from .yaml_config import add_rule, get_config_value, list_rules, load_config, remove_rule, set_config_value
 
@@ -291,6 +292,124 @@ def cmd_config_rules_remove(args):
     print(f"Removed rule [{args.index}] from {args.rule_type}")
 
 
+# ── msgbox source-github ─────────────────────────────────────
+
+
+def cmd_subscribe(args):
+    """Subscribe to notifications for a specific thread (discussion/issue)."""
+    thread_type = args.thread_type
+    number = args.number
+    popup = args.popup
+
+    if thread_type == "discussion":
+        ignore_pattern = "github.discussion_comment"
+        props = {"number": str(number)}
+    elif thread_type == "issue":
+        ignore_pattern = "github.issue_comment"
+        props = {"number": str(number)}
+    elif thread_type == "pr":
+        ignore_pattern = "github.review_comment|github.review"
+        props = {"number": str(number)}
+    else:
+        print(f"Unknown type: {thread_type}", file=sys.stderr)
+        sys.exit(1)
+
+    # Add ignore_excluded to bypass the default ignore rule for this thread
+    add_rule("ignore_excluded", ignore_pattern, props)
+    print(f"Subscribed to {thread_type} #{number} comments (ignore_excluded)")
+
+    if popup:
+        # Also add popup rule for comments on this thread
+        add_rule("popup", ignore_pattern, props)
+        print(f"  → {thread_type} #{number} comments will be popup")
+
+
+def cmd_unsubscribe(args):
+    """Unsubscribe by removing matching rules."""
+    thread_type = args.thread_type
+    number = args.number
+
+    if thread_type == "discussion":
+        patterns = ["github.discussion_comment"]
+    elif thread_type == "issue":
+        patterns = ["github.issue_comment"]
+    elif thread_type == "pr":
+        patterns = ["github.review_comment", "github.review"]
+    else:
+        print(f"Unknown type: {thread_type}", file=sys.stderr)
+        sys.exit(1)
+
+    props = {"number": str(number)}
+    cfg = load_config()
+    removed = 0
+
+    for rule_type in ("ignore_excluded", "popup"):
+        rules = cfg.get("rules", {}).get(rule_type, [])
+        to_remove = []
+        for i, rule in enumerate(rules):
+            if rule.get("type") in patterns and rule.get("props", {}).get("number") == str(number):
+                to_remove.append(i)
+        for i in reversed(to_remove):
+            remove_rule(rule_type, i)
+            removed += 1
+
+    print(f"Unsubscribed from {thread_type} #{number} (removed {removed} rules)")
+
+
+def cmd_subscriptions(args):
+    """List active subscriptions."""
+    rules = list_rules()
+    subs = []
+    for r in rules:
+        if r["type"] in ("ignore_excluded", "popup"):
+            props = r.get("props", {})
+            if "number" in props:
+                subs.append(r)
+    if not subs:
+        print("No active subscriptions")
+        return
+    print("Active subscriptions:")
+    for s in subs:
+        print(f"  [{s['type']}] {s['pattern']:35s} props={json.dumps(s['props'], ensure_ascii=False)}")
+
+
+def cmd_source_github(args):
+    """Start the GitHub webhook listener."""
+    gh_config = get_github_config()
+
+    port = args.port or gh_config.get("port", 3001)
+    smee_url = args.smee_url or gh_config.get("smee_url", "")
+    repos = args.repos or gh_config.get("repos", [])
+    events = args.events or gh_config.get("events", ["*"])
+    foreground = args.foreground
+
+    # Auto-detect bot's GitHub username from gh auth
+    import subprocess
+    try:
+        self_user = subprocess.run(
+            ["gh", "api", "user", "--jq", ".login"],
+            capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        if self_user:
+            print(f"Bot user detected: {self_user} (own events will be ignored)")
+    except Exception:
+        self_user = ""
+
+    if not repos and not args.repos:
+        repos = None
+    if not events:
+        events = None
+
+    run_server(
+        port=port,
+        smee_url=smee_url,
+        repos=repos,
+        events=events,
+        self_user=self_user,
+        foreground=foreground,
+    )
+
+
 # ── msgbox list-sessions ────────────────────────────────────
 
 
@@ -335,6 +454,28 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--all", action="store_true", help="Mark all delivered messages as done")
     sp.set_defaults(func=cmd_mark_done)
 
+    sp = sub.add_parser("source-github", help="Start GitHub webhook listener")
+    sp.add_argument("--port", "-p", type=int, help="HTTP listen port (default: 3001)")
+    sp.add_argument("--smee-url", help="Smee.io proxy URL")
+    sp.add_argument("--repos", nargs="*", help="Repo allowlist (e.g. owner/repo)")
+    sp.add_argument("--events", nargs="*", help="Event types to accept (e.g. push issues)")
+    sp.add_argument("--foreground", "-f", action="store_true", help="Run in foreground (default: daemon)")
+    sp.set_defaults(func=cmd_source_github)
+
+    sp = sub.add_parser("subscribe", help="Subscribe to thread notifications")
+    sp.add_argument("thread_type", choices=["discussion", "issue", "pr"])
+    sp.add_argument("number", type=int, help="Thread number")
+    sp.add_argument("--popup", action="store_true", help="Show as popup (default: normal)")
+    sp.set_defaults(func=cmd_subscribe)
+
+    sp = sub.add_parser("unsubscribe", help="Unsubscribe from thread notifications")
+    sp.add_argument("thread_type", choices=["discussion", "issue", "pr"])
+    sp.add_argument("number", type=int, help="Thread number")
+    sp.set_defaults(func=cmd_unsubscribe)
+
+    sp = sub.add_parser("subscriptions", help="List active subscriptions")
+    sp.set_defaults(func=cmd_subscriptions)
+
     cp = sub.add_parser("config", help="Manage configuration")
     csub = cp.add_subparsers(dest="config_cmd")
 
@@ -351,13 +492,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_config_rules)
 
     sp = csub.add_parser("add-rule", help="Add filter rule")
-    sp.add_argument("rule_type", choices=["popup", "popup_excluded", "silent", "silent_excluded"])
+    sp.add_argument("rule_type", choices=["popup", "popup_excluded", "silent", "silent_excluded", "ignore", "ignore_excluded"])
     sp.add_argument("pattern", help="Regex pattern for message type")
     sp.add_argument("--props", help='JSON props filters, e.g. \'{"repo":"my-project"}\'')
     sp.set_defaults(func=cmd_config_rules_add)
 
     sp = csub.add_parser("remove-rule", help="Remove filter rule by index")
-    sp.add_argument("rule_type", choices=["popup", "popup_excluded", "silent", "silent_excluded"])
+    sp.add_argument("rule_type", choices=["popup", "popup_excluded", "silent", "silent_excluded", "ignore", "ignore_excluded"])
     sp.add_argument("index", type=int)
     sp.set_defaults(func=cmd_config_rules_remove)
 

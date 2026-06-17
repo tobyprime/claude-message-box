@@ -60,7 +60,6 @@ class TestBackgroundTracking:
         assert len(tasks) == 2
 
     def test_empty(self, temp_bg_file):
-        # 文件不存在时，track 应正常工作
         check_bash.track_background("new task")
         tasks = json.loads(Path(temp_bg_file).read_text())
         assert len(tasks) == 1
@@ -105,7 +104,6 @@ class TestCheckBackgroundTasks:
 
 class TestHookMain:
     def _run(self, data: dict):
-        """运行 main()，返回 stderr 输出。"""
         old_stdin = sys.stdin
         old_stderr = sys.stderr
         sys.stdin = StringIO(json.dumps(data))
@@ -141,17 +139,26 @@ class TestHookMain:
         })
         assert stderr == ""
 
-    def test_fast_command_executes(self):
-        """快速命令（非安全列表）→ hook 执行后放行"""
-        stderr = self._run({
-            "tool_name": "Bash",
-            "tool_input": {"command": "echo hello"}
-        })
-        assert stderr == ""
+    def test_executed_command_blocked_with_result(self):
+        """hook 执行命令后应 block 并告知结果"""
+        with (
+            patch.object(check_bash, "execute_with_timeout",
+                         return_value=(0, "hello world", "")),
+            patch.object(check_bash, "BG_TRACKING_FILE", "/tmp/nonexistent-bg-test.json"),
+            patch.object(check_bash, "check_background_tasks"),
+        ):
+            stderr = self._run({
+                "tool_name": "Bash",
+                "tool_input": {"command": "printf hello"}
+            })
+            result = json.loads(stderr)
+            assert result["decision"] == "deny"
+            assert "already executed" in result["reason"]
 
     def test_timeout_deny(self):
-        """模拟超时场景：execute_with_timeout 返回 -1"""
-        with patch.object(check_bash, "execute_with_timeout", return_value=-1):
+        """超时时应 block 并提示用 background"""
+        with patch.object(check_bash, "execute_with_timeout",
+                          return_value=(-1, "", "")):
             stderr = self._run({
                 "tool_name": "Bash",
                 "tool_input": {"command": "sleep 100"}
@@ -161,14 +168,13 @@ class TestHookMain:
             assert "timed out" in result["reason"].lower()
 
     def test_execute_timeout_real(self):
-        """实际超时测试：3s timeout 对 10s sleep"""
-        rc = check_bash.execute_with_timeout("sleep 10", 3000)
+        rc, _, _ = check_bash.execute_with_timeout("sleep 10", 3000)
         assert rc == -1
 
     def test_execute_ok_real(self):
-        """快速命令应在 timeout 内完成"""
-        rc = check_bash.execute_with_timeout("echo hi", 5000)
+        rc, stdout, _ = check_bash.execute_with_timeout("echo hi", 5000)
         assert rc == 0
+        assert "hi" in stdout
 
     def test_invalid_json_passthrough(self):
         old_stdin = sys.stdin

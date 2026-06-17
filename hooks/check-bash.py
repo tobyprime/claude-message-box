@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """PreToolUse hook: 接管 Bash 命令执行，带超时检测。
 
+协议：
+  exit 0 → 放行（Claude 执行工具）
+  exit 2 + stderr JSON → 拒绝，Claude 看到 reason 后调整
+
 逻辑：
 1. 非 Bash / 已 background → exit 0 放行
-2. 安全命令（快速、只读）→ exit 0 放行
+2. 安全命令 → exit 0 放行（Claude 执行）
 3. 否则 → hook 自己执行命令，设超时（工具 timeout 或默认 60s）
-   - 命令在超时内完成 → exit 0 放行（Claude 也会执行一次，但无害）
-   - 超时 → kill 进程，exit 2 提示转 background
+   - 超时 → exit 2 提示转 background
+   - 完成 → exit 2 告知 Claude 命令已执行（不重跑）
 4. 后台任务跟踪，超过 10 分钟发通知
 """
 
@@ -23,7 +27,7 @@ BG_TRACKING_FILE = os.path.expanduser(
     "~/.claude/plugins/message-box/background_tasks.json"
 )
 
-# 快速命令前缀（直接放行，不经过 hook 执行）
+# 安全命令（直接放行，不经过 hook 执行）
 SAFE_PATTERN = re.compile(
     r'^(ls\b|pwd\b|echo\b|date\b|whoami\b|which\b|cat\b|head\b|tail\b|grep\b|find\b|'
     r'cd\b|mkdir\b|cp\b|mv\b|rm\b|diff\b|cmp\b|stat\b|du\b|df\b|wc\b|sort\b|uniq\b|'
@@ -52,7 +56,7 @@ def check_background_tasks():
         if elapsed > 600 and not task.get("notified", False):
             task["notified"] = True
             stale_notified.append(task)
-        if elapsed <= 3600:  # 清理超过 1 小时的记录
+        if elapsed <= 3600:
             remaining[key] = task
 
     with open(BG_TRACKING_FILE, "w") as f:
@@ -62,10 +66,7 @@ def check_background_tasks():
         for task in stale_notified:
             result = {
                 "decision": "deny",
-                "reason": (
-                    f"Background task running for over 10 minutes: "
-                    f"{task.get('command', 'unknown')[:100]}"
-                ),
+                "reason": f"Background task running for over 10 minutes: {task.get('command', 'unknown')[:100]}",
             }
             print(json.dumps(result), file=sys.stderr)
             sys.exit(2)
@@ -93,12 +94,12 @@ def track_background(command: str):
         json.dump(tasks, f)
 
 
-def execute_with_timeout(command: str, timeout_ms: int) -> int:
-    """执行命令，超时则 kill。返回 -1 表示超时，否则返回 exit code。"""
+def execute_with_timeout(command: str, timeout_ms: int) -> tuple[int, str, str]:
+    """执行命令，超时则 kill。返回 (rc, stdout, stderr)。"""
     proc = subprocess.Popen(
         ["bash", "-c", command],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         preexec_fn=lambda: signal.signal(signal.SIGTERM, lambda *_: os._exit(1)),
     )
 
@@ -113,14 +114,14 @@ def execute_with_timeout(command: str, timeout_ms: int) -> int:
 
     timer = threading.Timer(timeout_ms / 1000.0, kill_proc)
     timer.start()
-    proc.wait()
+    stdout, stderr = proc.communicate()
     timer.cancel()
 
-    return -1 if timed_out[0] else proc.returncode
+    rc = -1 if timed_out[0] else proc.returncode
+    return rc, stdout.decode("utf-8", errors="replace").strip(), stderr.decode("utf-8", errors="replace").strip()
 
 
 def main():
-    # 先检查后台任务
     check_background_tasks()
 
     input_data = sys.stdin.read()
@@ -134,34 +135,42 @@ def main():
     timeout = tool_input.get("timeout")
     run_bg = tool_input.get("run_in_background", False)
 
-    # 1. 非 Bash / 已 background → 放行
+    if data.get("tool_name") != "Bash":
+        sys.exit(0)
+
     if run_bg:
         track_background(command)
         sys.exit(0)
 
-    # 2. 安全命令 → 直接放行
     if SAFE_PATTERN.match(command.strip()):
         sys.exit(0)
 
-    # 3. 执行命令，检测超时
+    # 执行命令，检测超时
     timeout_ms = timeout if timeout and isinstance(timeout, (int, float)) and timeout > 0 else 60000
-    rc = execute_with_timeout(command, timeout_ms)
+    rc, stdout, stderr = execute_with_timeout(command, timeout_ms)
 
     if rc == -1:
-        # 超时了 → 拒绝，提示用 background
+        # 超时 → block，提示用 background
         result = {
             "decision": "deny",
-            "reason": (
-                f"Command timed out after {timeout_ms // 1000}s. "
-                f"It may take longer than expected. "
-                f"Re-run with `run_in_background: true` so it doesn't block."
-            ),
+            "reason": f"Command timed out after {timeout_ms // 1000}s. Re-run with `run_in_background: true` so it doesn't block.",
         }
         print(json.dumps(result), file=sys.stderr)
         sys.exit(2)
 
-    # 完成了 → 放行（Claude 会再执行一次，但快命令第二次也很快）
-    sys.exit(0)
+    # 执行完毕 → block，告知 Claude 结果（避免重跑）
+    msg = f"Command already executed (exit={rc})"
+    if stdout:
+        msg += f"\nstdout:\n{stdout[:2000]}"
+    if stderr:
+        msg += f"\nstderr:\n{stderr[:2000]}"
+
+    result = {
+        "decision": "deny",
+        "reason": msg,
+    }
+    print(json.dumps(result), file=sys.stderr)
+    sys.exit(2)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from msgbox.template import (
     render,
     _format_single_message,
     render_brief,
+    _relative_time,
     set_builtin_vars,
 )
 
@@ -110,3 +111,62 @@ class TestRenderBrief:
         result = render_brief("{POPUP_MESSAGE_COUNT} !{echo OK}", "{MESSAGE_TITLE}", popups, [], [])
         assert "1" in result
         assert "OK" in result
+
+
+class TestRelativeTime:
+    """验证 _relative_time 函数"""
+
+    def test_just_now(self):
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).isoformat()
+        assert _relative_time(ts) == "刚刚"
+
+    def test_seconds_ago(self):
+        from datetime import datetime, timezone, timedelta
+        ts = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        result = _relative_time(ts)
+        assert result in ("30秒前", "31秒前"), f"got {result}"
+
+    def test_minutes_ago(self):
+        from datetime import datetime, timezone, timedelta
+        ts = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        result = _relative_time(ts)
+        assert result in ("5分钟前",), f"got {result}"
+
+    def test_hours_ago(self):
+        from datetime import datetime, timezone, timedelta
+        ts = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        assert _relative_time(ts) == "3小时前"
+
+    def test_days_ago(self):
+        from datetime import datetime, timezone, timedelta
+        ts = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        assert _relative_time(ts) == "7天前"
+
+    def test_months_ago(self):
+        from datetime import datetime, timezone, timedelta
+        ts = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+        assert _relative_time(ts) == "2月前"
+
+    def test_invalid_input(self):
+        assert _relative_time("not-a-date") == ""
+
+    def test_empty_input(self):
+        assert _relative_time("") == ""
+
+
+class TestFormatSingleMessageTimeAgo:
+    """验证 MESSAGE_TIME_AGO 变量在消息渲染中生效"""
+
+    def test_time_ago_in_item(self):
+        from datetime import datetime, timezone, timedelta
+        ts = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        msg = {"id": 1, "type": "test", "title": "Hi", "content": "hello", "category": "normal", "props": "{}", "created_at": ts}
+        result = _format_single_message(msg, "{MESSAGE_TIME_AGO}: {MESSAGE_TITLE}")
+        assert "分钟前: Hi" in result
+
+    def test_time_ago_fallback_empty(self):
+        """无 created_at 时 MESSAGE_TIME_AGO 为空"""
+        msg = {"id": 1, "type": "test", "title": "Hi", "content": "hello", "category": "normal", "props": "{}"}
+        result = _format_single_message(msg, "[{MESSAGE_TIME_AGO}]")
+        assert result == "[]"

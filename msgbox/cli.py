@@ -20,6 +20,7 @@ from . import session as session_db
 from .filter import classify_message
 from .sources.github import run_server, get_github_config
 from .sources.inbox import run_inbox_source
+from .sources.dingtalk import run_dingtalk_source
 from .template import render_brief
 from .yaml_config import add_rule, get_config_value, list_rules, load_config, remove_rule, set_config_value
 
@@ -471,34 +472,8 @@ def cmd_source_inbox(args):
 
 
 def cmd_source_dingtalk(args):
-    """Start the DingTalk stream client (Node.js)."""
-    import subprocess
-    import sys
-    from pathlib import Path
-
-    client_id = args.client_id or ""
-    client_secret = args.client_secret or ""
-
-    if not client_id:
-        client_id = input("DingTalk Client ID: ").strip()
-    if not client_secret:
-        import getpass
-        client_secret = getpass.getpass("DingTalk Client Secret: ").strip()
-
-    if not client_id or not client_secret:
-        print("Client ID and Secret are required", file=sys.stderr)
-        sys.exit(1)
-
-    js_path = Path(__file__).parent / "sources" / "dingtalk.js"
-    if not js_path.exists():
-        js_path = Path("/opt/claude-message-box/msgbox/sources/dingtalk.js")
-
-    env = dict(os.environ)
-    env["DINGTALK_CLIENT_ID"] = client_id
-    env["DINGTALK_CLIENT_SECRET"] = client_secret
-
-    print(f"Starting DingTalk source...")
-    subprocess.run(["node", str(js_path), str(config.CENTRAL_DB)], env=env)
+    """Start the DingTalk notification poller via dws CLI."""
+    run_dingtalk_source(interval=args.interval, foreground=args.foreground)
 
 
 # ── msgbox history ──────────────────────────────────────────
@@ -598,11 +573,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--foreground", "-f", action="store_true", help="Run in foreground (default: daemon)")
     sp.set_defaults(func=cmd_source_inbox)
 
-    sp = sub.add_parser("source-dingtalk", help="Start DingTalk stream client")
-    sp.add_argument("--client-id", help="DingTalk Client ID")
-    sp.add_argument("--client-secret", help="DingTalk Client Secret")
+    sp = sub.add_parser("source-dingtalk", help="Start DingTalk notification poller (dws CLI)")
+    sp.add_argument("--interval", "-i", type=int, default=60, help="Poll interval in seconds (default: 60)")
     sp.add_argument("--foreground", "-f", action="store_true", help="Run in foreground")
-    sp.add_argument("--save-config", action="store_true", help="Save Client ID to config")
     sp.set_defaults(func=cmd_source_dingtalk)
 
     sp = sub.add_parser("subscribe", help="Subscribe to thread notifications")

@@ -117,6 +117,14 @@ def get_unread_popup_count(db_path: str, excluded_ids: set[int]) -> int:
     return row["cnt"] if row else 0
 
 
+def get_all_popup_ids(db_path: str) -> set[int]:
+    rows = _with_cursor(
+        db_path,
+        lambda c: c.execute("SELECT id FROM messages WHERE category='popup'").fetchall(),
+    )
+    return {r["id"] for r in rows}
+
+
 def get_undelivered_messages(db_path: str, excluded_ids: set[int], categories: tuple[str, ...], limit: int = 50) -> list[dict]:
     if not excluded_ids:
         placeholders = ""

@@ -43,6 +43,15 @@ def cmd_start(args):
         sys.exit(1)
     db_path = _session_db_path(sid)
     session_db.init_session_db(db_path)
+
+    # 新会话默认所有已有 popup 标记为 closed，避免历史消息刷屏
+    central_db.init_central_db(config.CENTRAL_DB)
+    done = session_db.get_done_ids(db_path)
+    all_popups = central_db.get_all_popup_ids(config.CENTRAL_DB)
+    unclosed = all_popups - done
+    if unclosed:
+        session_db.mark_done(db_path, list(unclosed))
+
     print(f"msg_box activated: session={sid}")
 
 
@@ -111,14 +120,16 @@ def cmd_wait(args):
     item_template = templates.get("item", "")
 
     excluded_ids = session_db.get_excluded_ids(db_path)
+    done_ids = session_db.get_done_ids(db_path)
     idle_duration = config.IDLE_DURATION
     sleep_duration = config.SLEEP_DURATION
 
     # Phase 1: 检查 popup（立即返回）
-    popup_count = central_db.get_unread_popup_count(config.CENTRAL_DB, excluded_ids)
+    # popup 只用 done（close）过滤，不看 delivered（peek）
+    # 所以 peek 看过但没 close 的 popup 会继续弹出
+    popup_count = central_db.get_unread_popup_count(config.CENTRAL_DB, done_ids)
     if popup_count > 0:
-        popups = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("popup",))
-        session_db.mark_delivered(db_path, [m["id"] for m in popups])
+        popups = central_db.get_undelivered_messages(config.CENTRAL_DB, done_ids, ("popup",))
         output = render_brief(brief_template, item_template, popups, [])
         print(output, file=sys.stderr)
         sys.exit(2)
@@ -131,11 +142,13 @@ def cmd_wait(args):
         time.sleep(poll_interval)
         elapsed += poll_interval
         excluded_ids = session_db.get_excluded_ids(db_path)
-        normals = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("popup", "normal"))
-        if normals:
-            popups = [m for m in normals if m["category"] == "popup"]
-            msgs = [m for m in normals if m["category"] == "normal"]
-            session_db.mark_delivered(db_path, [m["id"] for m in normals])
+        done_ids = session_db.get_done_ids(db_path)
+        # popup 只看 done，normal 看 delivered + done
+        popups = central_db.get_undelivered_messages(config.CENTRAL_DB, done_ids, ("popup",))
+        msgs = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("normal",))
+        if popups or msgs:
+            if msgs:
+                session_db.mark_delivered(db_path, [m["id"] for m in msgs])
             output = render_brief(brief_template, item_template, popups, msgs)
             print(output, file=sys.stderr)
             sys.exit(2)
@@ -198,11 +211,46 @@ def cmd_peek(args):
     popups = [m for m in new_msgs if m["category"] == "popup"]
     msgs = [m for m in new_msgs if m["category"] == "normal"]
 
+    # peek：popup 自动标记已阅，只看一次；normal 也自动标记
     session_db.mark_delivered(db_path, [m["id"] for m in new_msgs])
 
     output = render_brief(brief_template, item_template, popups, msgs)
     print(output, file=sys.stderr)
     sys.exit(2)
+
+
+# ── msgbox close ──────────────────────────────────────────
+
+
+def cmd_close(args):
+    """Close popup messages so they won't be shown again."""
+    sid = _session_id()
+    if not sid:
+        print("CLAUDE_CODE_SESSION_ID not set", file=sys.stderr)
+        sys.exit(1)
+
+    db_path = _session_db_path(sid)
+    if not Path(db_path).exists():
+        print("msg_box not active", file=sys.stderr)
+        sys.exit(1)
+
+    session_db.init_session_db(db_path)
+
+    if args.ids:
+        msg_ids = [int(x) for x in args.ids.split(",")]
+        session_db.mark_done(db_path, msg_ids)
+        print(f"Closed {len(msg_ids)} popup messages")
+        return
+
+    # Close all popups not yet closed（只用 done 过滤，和 wait 一致）
+    central_db.init_central_db(config.CENTRAL_DB)
+    done_ids = session_db.get_done_ids(db_path)
+    popups = central_db.get_undelivered_messages(config.CENTRAL_DB, done_ids, ("popup",))
+    if popups:
+        session_db.mark_done(db_path, [m["id"] for m in popups])
+        print(f"Closed {len(popups)} popup messages")
+    else:
+        print("No popup messages to close")
 
 
 # ── msgbox mark-done ────────────────────────────────────────
@@ -478,6 +526,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("peek", help="Quick peek for new messages (hook use)")
     sp.set_defaults(func=cmd_peek)
+
+    sp = sub.add_parser("close", help="Close popup messages so they stop appearing")
+    sp.add_argument("--ids", help="Comma-separated message IDs to close")
+    sp.set_defaults(func=cmd_close)
 
     sp = sub.add_parser("mark-done", help="Mark popup messages as processed")
     sp.add_argument("--ids", help="Comma-separated message IDs")

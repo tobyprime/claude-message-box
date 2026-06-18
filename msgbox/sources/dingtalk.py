@@ -5,6 +5,7 @@ import logging
 import subprocess
 import threading
 import time
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -37,11 +38,20 @@ def _extract_items(data: Any) -> list[dict]:
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
-        # Common wrappers: {items: [...]}, {result: [...]}, {list: [...]}, {data: [...]}
-        for key in ("items", "result", "list", "data", "records"):
+        # Common wrappers: {items: [...]}, {result: [...]}, {list: [...]}, {data: [...]}, {records: [...]}
+        for key in ("items", "list", "data", "records"):
             val = data.get(key)
             if isinstance(val, list):
                 return val
+        # {result: {conversations: [...]}} or {result: [...]}
+        result = data.get("result")
+        if isinstance(result, dict):
+            for key in ("conversations", "items", "list", "data", "records"):
+                val = result.get(key)
+                if isinstance(val, list):
+                    return val
+        if isinstance(result, list):
+            return result
         # Maybe it's a single item
         if "id" in data or "processInstanceId" in data:
             return [data]
@@ -64,8 +74,10 @@ def poll_cc_approvals() -> list[dict]:
 
 
 def poll_mentions() -> list[dict]:
-    """@我的消息"""
-    data = _dws(["chat", "message", "list-mentions"])
+    """@我的消息（最近7天）"""
+    now = int(time.time() * 1000)
+    seven_days_ago = now - 7 * 86400 * 1000
+    data = _dws(["chat", "message", "list-mentions", "--start", str(seven_days_ago), "--end", str(now)])
     return _extract_items(data)
 
 
@@ -154,17 +166,14 @@ def map_mention(item: dict) -> dict | None:
 def map_unread_conversation(item: dict) -> dict | None:
     """未读会话 → msgbox 消息"""
     title = item.get("title") or item.get("conversationTitle", "未读会话")
-    unread = item.get("unreadCount", 0)
-    last_msg = item.get("lastMessage") or item.get("lastMsg", {})
-    last_content = ""
-    if isinstance(last_msg, dict):
-        last_content = last_msg.get("textContent") or last_msg.get("content", "") or json.dumps(last_msg)[:100]
+    unread = item.get("unreadPoint") or item.get("unreadCount", 0)
+    conv_id = item.get("openConversationId") or item.get("conversationId", "")
     return {
         "type": "dingtalk.unread",
         "title": f"[未读] {title} ({unread}条)",
-        "content": last_content[:300] if last_content else f"{unread} 条未读消息",
+        "content": f"{unread} 条未读消息",
         "props": {
-            "conversationId": item.get("conversationId", ""),
+            "conversationId": conv_id,
             "title": title,
             "unreadCount": str(unread),
             "source": "dingtalk",
@@ -282,22 +291,10 @@ def poll_dingtalk(interval: int, stop_event: threading.Event):
         ("reports", poll_inbox_reports, map_report),
     ]
 
-    # Warmup: mark all existing as seen on first run
-    logger.info("DingTalk source warming up...")
+    # First run: insert all items (warmup populates seen_keys without DB check)
+    logger.info("DingTalk source first run...")
     for poll_name, poll_fn, mapper_fn in pollers:
-        try:
-            items = poll_fn()
-            if items:
-                logger.info(f"  {poll_name}: {len(items)} items")
-                for item in items:
-                    msg = mapper_fn(item)
-                    if msg:
-                        key = _dedup_key(msg)
-                        if key:
-                            seen_keys.add(key)
-        except Exception as exc:
-            logger.debug(f"  {poll_name}: {exc}")
-    logger.info(f"DingTalk source warmup done, {len(seen_keys)} known items")
+        _poll_and_insert(poll_fn, mapper_fn, seen_keys, poll_name)
 
     # Polling loop
     while not stop_event.is_set():

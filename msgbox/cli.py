@@ -19,6 +19,7 @@ from . import db as central_db
 from . import session as session_db
 from .filter import classify_message
 from .sources.github import run_server, get_github_config
+from .sources.inbox import run_inbox_source
 from .template import render_brief
 from .yaml_config import add_rule, get_config_value, list_rules, load_config, remove_rule, set_config_value
 
@@ -458,6 +459,11 @@ def cmd_source_github(args):
     )
 
 
+def cmd_source_inbox(args):
+    """Start the GitHub inbox notification poller."""
+    run_inbox_source(interval=args.interval, foreground=args.foreground)
+
+
 # ── msgbox history ──────────────────────────────────────────
 
 
@@ -547,6 +553,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--events", nargs="*", help="Event types to accept (e.g. push issues)")
     sp.add_argument("--foreground", "-f", action="store_true", help="Run in foreground (default: daemon)")
     sp.set_defaults(func=cmd_source_github)
+
+    sp = sub.add_parser("source-inbox", help="Start GitHub inbox notification poller")
+    sp.add_argument("--interval", "-i", type=int, default=30, help="Poll interval in seconds (default: 30)")
+    sp.add_argument("--foreground", "-f", action="store_true", help="Run in foreground (default: daemon)")
+    sp.set_defaults(func=cmd_source_inbox)
 
     sp = sub.add_parser("subscribe", help="Subscribe to thread notifications")
     sp.add_argument("thread_type", choices=["discussion", "issue", "pr"])

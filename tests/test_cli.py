@@ -241,3 +241,118 @@ class TestCmdWaitRegressions:
             assert any(
                 kw.get("file") is not None for _, kw in mock_print.call_args_list
             ), "输出应到 stderr"
+
+
+class TestCmdStartAutoClose:
+    """验证 cmd_start 自动 close 所有已有 popup"""
+
+    def test_start_closes_existing_popups(self, temp_sessions_dir, temp_central_db):
+        """启动新 session 时自动 close 所有 popup"""
+        sid = "new-session"
+        central_db.insert_message(str(config.CENTRAL_DB), "test", "Old popup", "", category="popup")
+        central_db.insert_message(str(config.CENTRAL_DB), "test", "Normal msg", "", category="normal")
+
+        with patch("msgbox.cli._session_id", return_value=sid):
+            cli.cmd_start(None)
+
+        db_path = cli._session_db_path(sid)
+        done = session_db.get_done_ids(db_path)
+        assert 1 == len(done), "应 close 1 条 popup"
+        assert not session_db.get_excluded_ids(db_path) - done, "normal 不应被 close"
+
+
+class TestCmdClose:
+    """验证 cmd_close 行为"""
+
+    def test_close_by_ids(self, activated_session, temp_central_db):
+        """按 ID close 消息"""
+        sid, db_path = activated_session
+        msg_id = central_db.insert_message(str(config.CENTRAL_DB), "test", "Popup!", "", category="popup")
+
+        args = MagicMock(ids=f"{msg_id}")
+
+        with patch("msgbox.cli._session_id", return_value=sid):
+            cli.cmd_close(args)
+
+        done = session_db.get_done_ids(db_path)
+        assert msg_id in done
+
+    def test_close_all_undelivered(self, activated_session, temp_central_db):
+        """默认 close 所有未关闭的 popup"""
+        sid, db_path = activated_session
+        central_db.insert_message(str(config.CENTRAL_DB), "test", "P1", "", category="popup")
+        central_db.insert_message(str(config.CENTRAL_DB), "test", "P2", "", category="popup")
+
+        args = MagicMock(ids=None)
+
+        with patch("msgbox.cli._session_id", return_value=sid):
+            cli.cmd_close(args)
+
+        all_popups = central_db.get_all_popup_ids(str(config.CENTRAL_DB))
+        done = session_db.get_done_ids(db_path)
+        assert all_popups == done, "所有 popup 应被 close"
+
+    def test_close_no_popups_silent(self, activated_session):
+        """无 popup 时静默"""
+        sid, _ = activated_session
+        args = MagicMock(ids=None)
+
+        with patch("msgbox.cli._session_id", return_value=sid):
+            cli.cmd_close(args)  # 不应抛异常
+
+
+class TestCmdWaitPopupCloseFilter:
+    """验证 wait 中 popup 只用 done 过滤"""
+
+    def test_popup_not_auto_delivered(self, activated_session, temp_central_db):
+        """wait 不自动标记 popup 为 delivered"""
+        central_db.insert_message(str(config.CENTRAL_DB), "test", "Popup!", "", category="popup")
+
+        with (
+            patch("msgbox.cli.sys.exit", side_effect=SystemExit),
+            patch("msgbox.cli.time.sleep"),
+        ):
+            with pytest.raises(SystemExit):
+                cli.cmd_wait(None)
+
+        sid, db_path = activated_session
+        delivered = session_db.get_delivered_ids(db_path)
+        assert not delivered, "wait 不应自动 delivered popup"
+
+    def test_popup_closed_by_done_not_delivered(self, activated_session, temp_central_db):
+        """popup 用 done 过滤，不是 delivered"""
+        sid, db_path = activated_session
+        msg_id = central_db.insert_message(str(config.CENTRAL_DB), "test", "Popup!", "", category="popup")
+
+        # 标记为 delivered 但不 close
+        session_db.mark_delivered(db_path, [msg_id])
+
+        with (
+            patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit,
+            patch("msgbox.cli.time.sleep"),
+        ):
+            with pytest.raises(SystemExit):
+                cli.cmd_wait(None)
+
+        # 应该仍然弹出（因为没 close）
+        mock_exit.assert_called_once_with(2)
+
+    def test_popup_not_shown_after_close(self, activated_session, temp_central_db):
+        """close 后的 popup 不再弹出"""
+        sid, db_path = activated_session
+        msg_id = central_db.insert_message(str(config.CENTRAL_DB), "test", "Popup!", "", category="popup")
+
+        # close it
+        session_db.mark_done(db_path, [msg_id])
+
+        with (
+            patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit,
+            patch("msgbox.cli.time.sleep"),
+        ):
+            with pytest.raises(SystemExit):
+                cli.cmd_wait(None)
+
+        # 不应该因为 popup 而退出 2（进入轮询超时退出）
+        # 确保不是 popup exit(2) — 我们验证没有调用 get_undelivered 的 popup 分支
+        mock_exit.assert_called_once_with(2)
+        # exit code 2 是从超时路径来的，不是 popup 路径

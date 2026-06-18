@@ -58,12 +58,12 @@ def init_central_db(db_path: str):
             ON messages(created_at);
         CREATE INDEX IF NOT EXISTS idx_messages_category
             ON messages(category);
-        CREATE INDEX IF NOT EXISTS idx_messages_source
-            ON messages(source);
+        CREATE INDEX IF NOT EXISTS idx_messages_category
+            ON messages(category);
         """
         ),
     )
-    # Migration: add source column if missing (for existing DBs created before source column)
+    # Migration: add source column + index if missing (for existing DBs created before)
     try:
         _with_cursor(
             db_path,
@@ -71,6 +71,13 @@ def init_central_db(db_path: str):
         )
     except Exception:
         pass  # Column already exists
+    try:
+        _with_cursor(
+            db_path,
+            lambda c: c.execute("CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source);"),
+        )
+    except Exception:
+        pass  # Index already exists
 
 
 def insert_message(db_path: str, type_: str, title: str, content: str, props: dict | None = None, category: str = "normal", source: str = "") -> int:
@@ -136,7 +143,50 @@ def get_all_popup_ids(db_path: str) -> set[int]:
     return {r["id"] for r in rows}
 
 
+def get_max_message_id(db_path: str) -> int:
+    row = _with_cursor(
+        db_path,
+        lambda c: c.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages").fetchone(),
+    )
+    return row["max_id"] if row else 0
+
+
+def get_messages_after(
+    db_path: str,
+    after_id: int,
+    categories: tuple[str, ...],
+    excluded_ids: set[int] | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """查询 id > after_id、指定类别、可选排除集合的消息。"""
+    conditions = ["id > ?"]
+    params: list = [after_id]
+
+    if categories:
+        cat_placeholders = ",".join("?" * len(categories))
+        conditions.append(f"category IN ({cat_placeholders})")
+        params.extend(categories)
+
+    if excluded_ids:
+        placeholders = ",".join("?" * len(excluded_ids))
+        conditions.append(f"id NOT IN ({placeholders})")
+        params.extend(excluded_ids)
+
+    where_clause = " WHERE " + " AND ".join(conditions)
+    sql = f"SELECT * FROM messages{where_clause} ORDER BY id ASC LIMIT ?"
+    params.append(limit)
+
+    rows = _with_cursor(
+        db_path,
+        lambda c: c.execute(sql, params).fetchall(),
+    )
+    return [dict(r) for r in rows]
+
+
 def get_undelivered_messages(db_path: str, excluded_ids: set[int], categories: tuple[str, ...], limit: int = 50) -> list[dict]:
+    """兼容旧 API：基于排除集合查询未读消息。"""
+    return get_messages_after(db_path, 0, categories, excluded_ids=excluded_ids, limit=limit)
+
     if not excluded_ids:
         placeholders = ""
         params: list = []

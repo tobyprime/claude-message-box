@@ -66,9 +66,10 @@ class TestCmdWaitDuration:
             patch("msgbox.cli.time.sleep", side_effect=_sleep),
             patch("msgbox.cli.sys.exit", side_effect=SystemExit),
         ):
-            mock_session_db.get_excluded_ids.return_value = set()
-            mock_central_db.get_unread_popup_count.return_value = 0
-            mock_central_db.get_undelivered_messages.return_value = []
+            mock_session_db.get_read_cursor.return_value = 0
+            mock_session_db.get_open_popups.return_value = set()
+            mock_central_db.get_messages_after.return_value = []
+            mock_central_db.get_messages_by_ids.return_value = []
 
             with pytest.raises(SystemExit):
                 cli.cmd_wait(None)
@@ -110,7 +111,7 @@ class TestCmdWaitPopups:
         """无 popup 时进入轮询，中途有消息应 exit(2)"""
         call_count = [0]
 
-        def mock_get_undelivered(*args, **kwargs):
+        def mock_get_messages_after(*args, **kwargs):
             call_count[0] += 1
             if call_count[0] >= 3:
                 return [{"id": 1, "category": "normal", "type": "test", "title": "Late msg", "content": "hello", "props": {}}]
@@ -119,7 +120,8 @@ class TestCmdWaitPopups:
         with (
             patch.object(config, "IDLE_DURATION", 10),
             patch.object(config, "SLEEP_DURATION", 10),
-            patch("msgbox.cli.central_db.get_undelivered_messages", side_effect=mock_get_undelivered),
+            patch("msgbox.cli.central_db.get_messages_after", side_effect=mock_get_messages_after),
+            patch("msgbox.cli.central_db.get_messages_by_ids", return_value=[]),
             patch("msgbox.cli.time.sleep"),
             patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit,
         ):
@@ -216,9 +218,10 @@ class TestCmdWaitRegressions:
                     patch("msgbox.cli.time.sleep", side_effect=_sleep),
                     patch("msgbox.cli.sys.exit", side_effect=SystemExit),
                 ):
-                    mock_session_db.get_excluded_ids.return_value = set()
-                    mock_central_db.get_unread_popup_count.return_value = 0
-                    mock_central_db.get_undelivered_messages.return_value = []
+                    mock_session_db.get_read_cursor.return_value = 0
+                    mock_session_db.get_open_popups.return_value = set()
+                    mock_central_db.get_messages_after.return_value = []
+                    mock_central_db.get_messages_by_ids.return_value = []
 
                     with pytest.raises(SystemExit):
                         cli.cmd_wait(None)
@@ -244,10 +247,10 @@ class TestCmdWaitRegressions:
 
 
 class TestCmdStartAutoClose:
-    """验证 cmd_start 自动 close 所有已有 popup"""
+    """验证 cmd_start 启动行为"""
 
-    def test_start_closes_existing_popups(self, temp_sessions_dir, temp_central_db):
-        """启动新 session 时自动 close 所有 popup"""
+    def test_start_sets_cursor_to_max(self, temp_sessions_dir, temp_central_db):
+        """启动新 session 时把 read_cursor 推到最大 id，避免历史消息刷屏"""
         sid = "new-session"
         central_db.insert_message(str(config.CENTRAL_DB), "test", "Old popup", "", category="popup")
         central_db.insert_message(str(config.CENTRAL_DB), "test", "Normal msg", "", category="normal")
@@ -256,9 +259,24 @@ class TestCmdStartAutoClose:
             cli.cmd_start(None)
 
         db_path = cli._session_db_path(sid)
-        done = session_db.get_done_ids(db_path)
-        assert 1 == len(done), "应 close 1 条 popup"
-        assert not session_db.get_excluded_ids(db_path) - done, "normal 不应被 close"
+        assert session_db.get_read_cursor(db_path) == 2
+        assert session_db.get_open_popups(db_path) == set()
+
+    def test_start_ignores_historical_messages(self, temp_sessions_dir, temp_central_db):
+        """启动后 historical normal 不再被 peek 出来"""
+        sid = "new-session"
+        central_db.insert_message(str(config.CENTRAL_DB), "test", "Old normal", "", category="normal")
+
+        with patch("msgbox.cli._session_id", return_value=sid):
+            cli.cmd_start(None)
+
+        with (
+            patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit,
+            patch("msgbox.cli._touch_peek_cooldown"),
+            patch("msgbox.cli._check_peek_cooldown", return_value=False),
+        ):
+            cli.cmd_peek(None)
+            assert not mock_exit.called, "历史消息不应触发 exit"
 
 
 class TestCmdClose:
@@ -274,26 +292,24 @@ class TestCmdClose:
         with patch("msgbox.cli._session_id", return_value=sid):
             cli.cmd_close(args)
 
-        done = session_db.get_done_ids(db_path)
-        assert msg_id in done
+        assert session_db.get_open_popups(db_path) == set()
 
-    def test_close_all_delivered(self, activated_session, temp_central_db):
-        """默认只 close 已经 peek 过的 popup"""
+    def test_close_only_delivered_open_popups(self, activated_session, temp_central_db):
+        """默认只 close 已经 delivery 过的 popup"""
         sid, db_path = activated_session
         p1 = central_db.insert_message(str(config.CENTRAL_DB), "test", "P1", "", category="popup")
         p2 = central_db.insert_message(str(config.CENTRAL_DB), "test", "P2", "", category="popup")
 
         # Simulate peek: p1 delivered, p2 not yet
-        session_db.mark_delivered(db_path, [p1])
+        session_db.mark_popups_delivered(db_path, [p1])
 
         args = MagicMock(ids=None)
 
         with patch("msgbox.cli._session_id", return_value=sid):
             cli.cmd_close(args)
 
-        done = session_db.get_done_ids(db_path)
-        assert p1 in done, "已 peek 的 popup 应被 close"
-        assert p2 not in done, "未 peek 的 popup 不应被 close"
+        assert p1 not in session_db.get_open_popups(db_path), "已 delivered 的 popup 应被 close"
+        assert p2 not in session_db.get_open_popups(db_path), "未 delivery 的 popup 不应进入 open_popups"
 
     def test_close_no_popups_silent(self, activated_session):
         """无 popup 时静默"""
@@ -305,7 +321,7 @@ class TestCmdClose:
 
 
 class TestCmdWaitPopupCloseFilter:
-    """验证 wait 中 popup 只用 done 过滤"""
+    """验证 wait 中 popup 用 open_popups 过滤"""
 
     def test_popup_auto_delivered_by_wait(self, activated_session, temp_central_db):
         """wait 标记 popup 为 delivered（供 close 识别已看过）"""
@@ -319,26 +335,7 @@ class TestCmdWaitPopupCloseFilter:
                 cli.cmd_wait(None)
 
         sid, db_path = activated_session
-        delivered = session_db.get_delivered_ids(db_path)
-        assert len(delivered) == 1, "wait 应自动 delivered popup"
-
-    def test_popup_closed_by_done_not_delivered(self, activated_session, temp_central_db):
-        """popup 用 done 过滤，不是 delivered"""
-        sid, db_path = activated_session
-        msg_id = central_db.insert_message(str(config.CENTRAL_DB), "test", "Popup!", "", category="popup")
-
-        # 标记为 delivered 但不 close
-        session_db.mark_delivered(db_path, [msg_id])
-
-        with (
-            patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit,
-            patch("msgbox.cli.time.sleep"),
-        ):
-            with pytest.raises(SystemExit):
-                cli.cmd_wait(None)
-
-        # 应该仍然弹出（因为没 close）
-        mock_exit.assert_called_once_with(2)
+        assert session_db.get_open_popups(db_path, delivered_only=True) == {1}, "wait 应自动 delivered popup"
 
     def test_popup_not_shown_after_close(self, activated_session, temp_central_db):
         """close 后的 popup 不再弹出"""
@@ -346,7 +343,7 @@ class TestCmdWaitPopupCloseFilter:
         msg_id = central_db.insert_message(str(config.CENTRAL_DB), "test", "Popup!", "", category="popup")
 
         # close it
-        session_db.mark_done(db_path, [msg_id])
+        session_db.close_popups(db_path, [msg_id])
 
         with (
             patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit,
@@ -355,7 +352,5 @@ class TestCmdWaitPopupCloseFilter:
             with pytest.raises(SystemExit):
                 cli.cmd_wait(None)
 
-        # 不应该因为 popup 而退出 2（进入轮询超时退出）
-        # 确保不是 popup exit(2) — 我们验证没有调用 get_undelivered 的 popup 分支
-        mock_exit.assert_called_once_with(2)
         # exit code 2 是从超时路径来的，不是 popup 路径
+        mock_exit.assert_called_once_with(2)

@@ -1,4 +1,9 @@
-"""会话跟踪数据库 - 每个激活的 session 独立"""
+"""会话跟踪数据库 - 每个激活的 session 独立
+
+状态模型：
+- read_cursor: 已阅普通消息的最大 id（所有 id <= cursor 的 normal 视为已阅）
+- open_popups: 仍未关闭的 popup 消息 id 集合（delivered 后仍保留，close 时删除）
+"""
 
 import sqlite3
 import threading
@@ -40,60 +45,130 @@ def init_session_db(db_path: str):
         db_path,
         lambda c: c.executescript(
             """
-        CREATE TABLE IF NOT EXISTS delivered (
-            msg_id INTEGER PRIMARY KEY
+        CREATE TABLE IF NOT EXISTS read_cursor (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            cursor INTEGER NOT NULL DEFAULT 0
         );
-        CREATE TABLE IF NOT EXISTS done (
-            msg_id INTEGER PRIMARY KEY
+        INSERT OR IGNORE INTO read_cursor (id, cursor) VALUES (1, 0);
+
+        CREATE TABLE IF NOT EXISTS open_popups (
+            msg_id INTEGER PRIMARY KEY,
+            delivered BOOLEAN NOT NULL DEFAULT 0
         );
         """
         ),
     )
 
 
-def get_delivered_ids(db_path: str) -> set[int]:
+def get_read_cursor(db_path: str) -> int:
+    row = _with_cursor(
+        db_path,
+        lambda c: c.execute("SELECT cursor FROM read_cursor WHERE id = 1").fetchone(),
+    )
+    return row["cursor"] if row else 0
+
+
+def set_read_cursor(db_path: str, cursor: int):
+    _with_cursor(
+        db_path,
+        lambda c: c.execute(
+            "INSERT OR REPLACE INTO read_cursor (id, cursor) VALUES (1, ?)",
+            [cursor],
+        ),
+    )
+
+
+def get_open_popups(db_path: str, delivered_only: bool = False) -> set[int]:
+    sql = "SELECT msg_id FROM open_popups"
+    if delivered_only:
+        sql += " WHERE delivered = 1"
     rows = _with_cursor(
         db_path,
-        lambda c: c.execute("SELECT msg_id FROM delivered").fetchall(),
+        lambda c: c.execute(sql).fetchall(),
     )
     return {r["msg_id"] for r in rows}
 
 
-def get_done_ids(db_path: str) -> set[int]:
-    rows = _with_cursor(
+def add_open_popups(db_path: str, msg_ids: list[int]):
+    if not msg_ids:
+        return
+    _with_cursor(
         db_path,
-        lambda c: c.execute("SELECT msg_id FROM done").fetchall(),
+        lambda c: c.executemany(
+            "INSERT OR IGNORE INTO open_popups (msg_id, delivered) VALUES (?, 0)",
+            [(i,) for i in msg_ids],
+        ),
     )
-    return {r["msg_id"] for r in rows}
+
+
+def mark_popups_delivered(db_path: str, msg_ids: list[int]):
+    if not msg_ids:
+        return
+    _with_cursor(
+        db_path,
+        lambda c: c.executemany(
+            "INSERT OR REPLACE INTO open_popups (msg_id, delivered) VALUES (?, 1)",
+            [(i,) for i in msg_ids],
+        ),
+    )
+
+
+def close_popups(db_path: str, msg_ids: list[int]):
+    if not msg_ids:
+        return
+    _with_cursor(
+        db_path,
+        lambda c: c.executemany(
+            "DELETE FROM open_popups WHERE msg_id = ?",
+            [(i,) for i in msg_ids],
+        ),
+    )
 
 
 def get_excluded_ids(db_path: str) -> set[int]:
-    """返回 delivered + done 的并集"""
-    return get_delivered_ids(db_path) | get_done_ids(db_path)
+    """返回 normal 已阅范围 + 已关闭 popup 的 id（用于历史兼容命令）。"""
+    cursor = get_read_cursor(db_path)
+    return set(range(1, cursor + 1))
+
+
+def get_done_ids(db_path: str) -> set[int]:
+    """历史兼容：返回已关闭 popup 的集合。
+
+    由于 popup 是否已关闭完全由中央库 messages 表决定，
+    这里不再单独维护关闭集合。调用方应通过 get_open_popups
+    与中央库 get_all_popup_ids 对比得到已关闭集合。
+    """
+    return set()
+
+
+def get_delivered_ids(db_path: str) -> set[int]:
+    """返回已阅 normal 的 id 集合（<= cursor）+ 已交付 popup 的 id。"""
+    cursor = get_read_cursor(db_path)
+    return set(range(1, cursor + 1)) | get_open_popups(db_path, delivered_only=True)
 
 
 def mark_delivered(db_path: str, msg_ids: list[int]):
+    """兼容旧 API：按消息 id 标记为已阅/已交付。"""
     if not msg_ids:
         return
-    _with_cursor(
-        db_path,
-        lambda c: c.executemany(
-            "INSERT OR IGNORE INTO delivered (msg_id) VALUES (?)",
-            [(i,) for i in msg_ids],
-        ),
-    )
+    cursor = get_read_cursor(db_path)
+    max_normal = cursor
+    popup_ids = []
+    for mid in msg_ids:
+        if mid <= cursor:
+            continue
+        popup_ids.append(mid)
+        if mid > max_normal:
+            max_normal = mid
+    if max_normal > cursor:
+        set_read_cursor(db_path, max_normal)
+    if popup_ids:
+        mark_popups_delivered(db_path, popup_ids)
 
 
 def mark_done(db_path: str, msg_ids: list[int]):
-    if not msg_ids:
-        return
-    _with_cursor(
-        db_path,
-        lambda c: c.executemany(
-            "INSERT OR IGNORE INTO done (msg_id) VALUES (?)",
-            [(i,) for i in msg_ids],
-        ),
-    )
+    """兼容旧 API：标记为已完成/关闭 popup。"""
+    close_popups(db_path, msg_ids)
 
 
 def get_active_sessions() -> list[dict]:

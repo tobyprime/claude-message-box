@@ -228,7 +228,7 @@ def _dedup_key(msg: dict) -> str:
     if dingtalk_type == "mention":
         return f"mention:{props.get('msgId', '')}"
     if dingtalk_type == "unread":
-        return f"unread:{props.get('conversationId', '')}"
+        return f"unread:{props.get('conversationId', '')}:{props.get('unreadCount', '0')}"
     if dingtalk_type == "todo":
         return f"todo:{props.get('taskId', '')}"
     if dingtalk_type == "report":

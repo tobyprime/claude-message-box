@@ -242,15 +242,19 @@ def cmd_close(args):
         print(f"Closed {len(msg_ids)} popup messages")
         return
 
-    # Close all popups not yet closed（只用 done 过滤，和 wait 一致）
+    # Close popups that have been peek-delivered but not yet closed
+    # 不关闭还没 peek 过的新 popup，避免新消息被误关
     central_db.init_central_db(config.CENTRAL_DB)
     done_ids = session_db.get_done_ids(db_path)
-    popups = central_db.get_undelivered_messages(config.CENTRAL_DB, done_ids, ("popup",))
-    if popups:
-        session_db.mark_done(db_path, [m["id"] for m in popups])
-        print(f"Closed {len(popups)} popup messages")
-    else:
-        print("No popup messages to close")
+    delivered_ids = session_db.get_delivered_ids(db_path)
+    all_popups = central_db.get_all_popup_ids(config.CENTRAL_DB)
+    unclosed_delivered = (all_popups - done_ids) & delivered_ids
+    if unclosed_delivered:
+        session_db.mark_done(db_path, list(unclosed_delivered))
+        print(f"Closed {len(unclosed_delivered)} popup messages")
+        return
+
+    print("No popup messages to close")
 
 
 # ── msgbox mark-done ────────────────────────────────────────

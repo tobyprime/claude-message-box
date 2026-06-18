@@ -277,20 +277,23 @@ class TestCmdClose:
         done = session_db.get_done_ids(db_path)
         assert msg_id in done
 
-    def test_close_all_undelivered(self, activated_session, temp_central_db):
-        """默认 close 所有未关闭的 popup"""
+    def test_close_all_delivered(self, activated_session, temp_central_db):
+        """默认只 close 已经 peek 过的 popup"""
         sid, db_path = activated_session
-        central_db.insert_message(str(config.CENTRAL_DB), "test", "P1", "", category="popup")
-        central_db.insert_message(str(config.CENTRAL_DB), "test", "P2", "", category="popup")
+        p1 = central_db.insert_message(str(config.CENTRAL_DB), "test", "P1", "", category="popup")
+        p2 = central_db.insert_message(str(config.CENTRAL_DB), "test", "P2", "", category="popup")
+
+        # Simulate peek: p1 delivered, p2 not yet
+        session_db.mark_delivered(db_path, [p1])
 
         args = MagicMock(ids=None)
 
         with patch("msgbox.cli._session_id", return_value=sid):
             cli.cmd_close(args)
 
-        all_popups = central_db.get_all_popup_ids(str(config.CENTRAL_DB))
         done = session_db.get_done_ids(db_path)
-        assert all_popups == done, "所有 popup 应被 close"
+        assert p1 in done, "已 peek 的 popup 应被 close"
+        assert p2 not in done, "未 peek 的 popup 不应被 close"
 
     def test_close_no_popups_silent(self, activated_session):
         """无 popup 时静默"""

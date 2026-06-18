@@ -135,6 +135,7 @@ def _map_notification(n: dict) -> dict | None:
             "type": raw_type,
             "reason": reason,
             "url": url,
+            "notif_id": n.get("id", ""),
             "updated_at": updated_at,
             "source": "inbox",
             "event": raw_type.lower(),
@@ -161,8 +162,13 @@ def poll_inbox(interval: int, stop_event: threading.Event):
     for ex in existing:
         try:
             ex_props = json.loads(ex.get("props", "{}")) if isinstance(ex.get("props"), str) else ex.get("props", {})
-            if ex_props.get("source") == "inbox" and ex_props.get("url"):
-                seen_urls.add(ex_props["url"])
+            if ex_props.get("source") == "inbox":
+                url = ex_props.get("url", "")
+                notif_id = ex_props.get("notif_id", "")
+                if url:
+                    seen_urls.add(url)
+                elif notif_id:
+                    seen_urls.add(f"id:{notif_id}")
         except Exception:
             pass
     if seen_urls:
@@ -185,12 +191,13 @@ def poll_inbox(interval: int, stop_event: threading.Event):
                 if msg is None:
                     continue
 
-                # Dedup: skip if same notification URL already seen
+                # Dedup by notification ID (always unique) or URL
+                notif_id = n.get("id", "")
                 url = msg.get("props", {}).get("url", "")
-                if url:
-                    if url in seen_urls:
-                        continue
-                    seen_urls.add(url)
+                dedup_key = url or f"id:{notif_id}"
+                if dedup_key in seen_urls:
+                    continue
+                seen_urls.add(dedup_key)
 
                 # Insert into DB
                 category = classify_message(msg["type"], msg.get("props", {}))

@@ -3,18 +3,108 @@
 import json
 import logging
 import os
+import sqlite3
 import subprocess
 import threading
 import time
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Any
 
 from .. import config
 from .. import db as central_db
 from ..filter import classify_message
 
-# 轮询间隔，默认 15 秒，可通过 DINGTALK_POLL_INTERVAL 环境变量覆盖
-DEFAULT_POLL_INTERVAL = int(os.environ.get("DINGTALK_POLL_INTERVAL", "15"))
+# 轮询间隔，默认 5 秒，可通过 DINGTALK_POLL_INTERVAL 环境变量覆盖
+DEFAULT_POLL_INTERVAL = int(os.environ.get("DINGTALK_POLL_INTERVAL", "5"))
+
+# 会话已读水位线 DB（本地持久化，因为钉钉 OpenAPI 没有提供"设置会话已读"接口）
+_STATE_DB = str(config.DINGTALK_STATE_DB)
+_state_local = threading.local()
+
+
+def _state_conn() -> sqlite3.Connection:
+    cached = getattr(_state_local, "conn", None)
+    if cached is not None:
+        return cached
+    Path(_STATE_DB).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(_STATE_DB)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS conversation_watermarks (
+            conversation_id TEXT PRIMARY KEY,
+            last_read_time  TEXT NOT NULL DEFAULT '',
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        """
+    )
+    conn.commit()
+    _state_local.conn = conn
+    return conn
+
+
+def _get_watermark(conv_id: str) -> str | None:
+    if not conv_id:
+        return None
+    row = _state_conn().execute(
+        "SELECT last_read_time FROM conversation_watermarks WHERE conversation_id = ?",
+        (conv_id,),
+    ).fetchone()
+    return row["last_read_time"] if row else None
+
+
+def _set_watermark(conv_id: str, last_read_time: str):
+    if not conv_id or not last_read_time:
+        return
+    _state_conn().execute(
+        """INSERT INTO conversation_watermarks (conversation_id, last_read_time, updated_at)
+           VALUES (?, ?, datetime('now'))
+           ON CONFLICT(conversation_id) DO UPDATE SET
+               last_read_time = excluded.last_read_time,
+               updated_at = datetime('now')""",
+        (conv_id, last_read_time),
+    )
+    _state_conn().commit()
+
+
+def _is_newer_than_watermark(conv_id: str, create_time: str) -> bool:
+    """判断消息是否比本地已读水位线更新。首次无水位线时视为新消息。"""
+    if not create_time:
+        return False
+    watermark = _get_watermark(conv_id)
+    if watermark is None:
+        return True
+    return create_time > watermark
+
+
+def _filter_new_messages(msgs: list[dict]) -> list[dict]:
+    """过滤出比本地水位线新的消息，并按时间正序排列。"""
+    new_msgs = [
+        m for m in msgs
+        if _is_newer_than_watermark(
+            m.get("openConversationId", "") or m.get("_conversation_id", ""),
+            m.get("createTime", ""),
+        )
+    ]
+    new_msgs.sort(key=lambda m: m.get("createTime", ""))
+    return new_msgs
+
+
+def _update_watermark_from_messages(msgs: list[dict]):
+    """根据处理过的消息更新各会话的已读水位线。"""
+    by_conv: dict[str, str] = {}
+    for m in msgs:
+        conv_id = m.get("openConversationId", "") or m.get("_conversation_id", "")
+        ts = m.get("createTime", "")
+        if not conv_id or not ts:
+            continue
+        if ts > by_conv.get(conv_id, ""):
+            by_conv[conv_id] = ts
+    for conv_id, ts in by_conv.items():
+        _set_watermark(conv_id, ts)
 
 logger = logging.getLogger("msgbox.sources.dingtalk")
 
@@ -108,7 +198,7 @@ def _ts_to_bj_str(ts_ms: int | None) -> str | None:
         return None
 
 
-def _fetch_conversation_messages(conv: dict, limit: int = 10) -> list[dict]:
+def _fetch_conversation_messages(conv: dict, limit: int | None = None) -> list[dict]:
     """根据会话信息拉取该会话的最新多条消息，并注入会话上下文。"""
     conv_id = conv.get("openConversationId", "")
     is_single = conv.get("singleChat", False)
@@ -123,7 +213,8 @@ def _fetch_conversation_messages(conv: dict, limit: int = 10) -> list[dict]:
     if not time_str:
         return []
 
-    fetch_limit = max(1, min(int(unread) if unread else 1, limit))
+    # 有多少未读就拉多少；未读为 0 时兜底拉 1 条用于更新水位线
+    fetch_limit = max(1, limit if limit is not None else (int(unread) if unread else 1))
     msgs: list[dict] = []
     try:
         if is_single:
@@ -169,8 +260,9 @@ def poll_unread_conversations() -> list[dict]:
     items = _extract_items(data)
     messages: list[dict] = []
     for conv in items:
-        messages.extend(_fetch_conversation_messages(conv, limit=10))
-    return messages
+        # 按会话未读数拉取，保证 15s 内 n 条新消息全部拿到
+        messages.extend(_fetch_conversation_messages(conv, limit=None))
+    return _filter_new_messages(messages)
 
 
 # 已知群聊列表（运行时积累，每次轮询拉取最新消息）
@@ -211,7 +303,7 @@ def poll_known_groups() -> list[dict]:
                 "--group", conv_id,
                 "--time", now_utc,
                 "--forward", "false",
-                "--limit", "10",
+                "--limit", "50",
             ])
             if msg_data:
                 msgs = _extract_items(msg_data)
@@ -223,7 +315,7 @@ def poll_known_groups() -> list[dict]:
                 messages.extend(msgs)
         except Exception:
             pass
-    return messages
+    return _filter_new_messages(messages)
 
 
 def poll_todo() -> list[dict]:
@@ -323,20 +415,48 @@ def _format_identifiers(props: dict) -> str:
     return " | ".join(parts)
 
 
+def _normalize_message_text(text: str) -> str:
+    """把钉钉消息里常见的字面量转义序列还原为真实字符。
+
+    钉钉服务端返回的文本中，换行符经常以字面量 \\n 形式存在
+    （例如 Markdown 消息），这里统一还原为真实换行，
+    让简报显示更自然。
+    """
+    return text.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r")
+
+
 def map_direct_message(msg: dict) -> dict | None:
     """单聊私信 → msgbox 消息（逐条）"""
     title = msg.get("_conversation_title") or "私聊"
     sender = msg.get("sender") or "未知"
-    content = (msg.get("content") or "").strip()
+    content = _normalize_message_text((msg.get("content") or "").strip())
     conv_id = msg.get("openConversationId", "") or msg.get("_conversation_id", "")
     user_id = msg.get("_user_id", "")
     msg_id = msg.get("openMessageId", "")
     sender_open_id = msg.get("senderOpenDingTalkId", "")
     create_time = msg.get("createTime", "")
 
-    body = f"[{sender}] {content}" if sender else content
+    # 标题展示消息内容摘要；正文展示完整消息 + 回复所需标识
+    body_parts = []
     if create_time:
-        body = f"{create_time}  {body}"
+        body_parts.append(f"时间: {create_time}")
+    if sender:
+        body_parts.append(f"发送者: {sender}")
+    if content:
+        body_parts.append(f"内容: {content}")
+    identifiers = _format_identifiers({
+        "conversationId": conv_id,
+        "openMessageId": msg_id,
+        "userId": user_id,
+        "senderOpenDingTalkId": sender_open_id,
+    })
+    if identifiers:
+        body_parts.append(f"标识: {identifiers}")
+
+    body = "\n".join(body_parts)
+    title_summary = content[:60] if content else "收到一条私聊消息"
+    if create_time:
+        title_summary = f"{create_time}  {title_summary}"
 
     props = {
         "conversationId": conv_id,
@@ -348,11 +468,10 @@ def map_direct_message(msg: dict) -> dict | None:
         "dingtalk_type": "direct",
         "source": "dingtalk",
     }
-    identifiers = _format_identifiers(props)
     return {
         "type": "dingtalk.direct",
-        "title": f"[私聊] {title} — {identifiers}",
-        "content": body[:300] if body else "收到一条私聊消息",
+        "title": f"[私聊] {title} — {title_summary}",
+        "content": body[:500] if body else "收到一条私聊消息",
         "props": props,
     }
 
@@ -361,15 +480,31 @@ def map_group_message(msg: dict) -> dict | None:
     """群聊消息 → msgbox 消息（逐条）"""
     title = msg.get("_conversation_title") or "群聊"
     sender = msg.get("sender") or "未知"
-    content = (msg.get("content") or "").strip()
+    content = _normalize_message_text((msg.get("content") or "").strip())
     conv_id = msg.get("openConversationId", "") or msg.get("_conversation_id", "")
     msg_id = msg.get("openMessageId", "")
     sender_open_id = msg.get("senderOpenDingTalkId", "")
     create_time = msg.get("createTime", "")
 
-    body = f"[{sender}] {content}" if sender else content
+    body_parts = []
     if create_time:
-        body = f"{create_time}  {body}"
+        body_parts.append(f"时间: {create_time}")
+    if sender:
+        body_parts.append(f"发送者: {sender}")
+    if content:
+        body_parts.append(f"内容: {content}")
+    identifiers = _format_identifiers({
+        "conversationId": conv_id,
+        "openMessageId": msg_id,
+        "senderOpenDingTalkId": sender_open_id,
+    })
+    if identifiers:
+        body_parts.append(f"标识: {identifiers}")
+
+    body = "\n".join(body_parts)
+    title_summary = content[:60] if content else "收到一条群聊消息"
+    if create_time:
+        title_summary = f"{create_time}  {title_summary}"
 
     props = {
         "conversationId": conv_id,
@@ -380,11 +515,10 @@ def map_group_message(msg: dict) -> dict | None:
         "dingtalk_type": "group",
         "source": "dingtalk",
     }
-    identifiers = _format_identifiers(props)
     return {
         "type": "dingtalk.group",
-        "title": f"[群聊] {title} — {identifiers}",
-        "content": body[:300] if body else "收到一条群聊消息",
+        "title": f"[群聊] {title} — {title_summary}",
+        "content": body[:500] if body else "收到一条群聊消息",
         "props": props,
     }
 
@@ -484,7 +618,8 @@ def _poll_and_insert(poll_fn, mapper_fn, seen_keys: set[str], poll_name: str):
 
 
 def _insert_conversation_messages(messages: list[dict], seen_keys: set[str]):
-    """Insert individual conversation messages into DB."""
+    """Insert individual conversation messages into DB, then update read watermark."""
+    inserted: list[dict] = []
     for msg in messages:
         is_single = msg.get("_single_chat", False)
         if not is_single:
@@ -516,9 +651,13 @@ def _insert_conversation_messages(messages: list[dict], seen_keys: set[str]):
             if msg_id:
                 if key:
                     seen_keys.add(key)
+                inserted.append(msg)
                 logger.info(f"DingTalk #{msg_id}: [{mapped['type']}] {mapped['title']} ({category})")
         except Exception as exc:
             logger.debug(f"DingTalk insert error: {exc}")
+
+    # 插入成功后再更新已读水位线，下次不再重复拉取
+    _update_watermark_from_messages(inserted)
 
 
 def _poll_unread(seen_keys: set[str]):
@@ -583,12 +722,12 @@ def run_dingtalk_source(interval: int | None = None, foreground: bool = True):
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    logger.info(f"DingTalk source starting (interval={interval}s)")
+    logger.info(f"DingTalk source starting (interval={interval}s, default={DEFAULT_POLL_INTERVAL}s)")
     stop_event = threading.Event()
     t = threading.Thread(
         target=poll_dingtalk,
         args=(interval, stop_event),
-        daemon=True,
+        daemon=False,
     )
     t.start()
 
@@ -599,5 +738,14 @@ def run_dingtalk_source(interval: int | None = None, foreground: bool = True):
         except KeyboardInterrupt:
             logger.info("Shutting down DingTalk source...")
             stop_event.set()
+            t.join(timeout=5)
     else:
+        # background 模式下保持主进程存活，避免 daemon 线程被回收
         logger.info("DingTalk source started in background")
+        try:
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            logger.info("Shutting down DingTalk source...")
+            stop_event.set()
+            t.join(timeout=5)

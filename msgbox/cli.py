@@ -116,7 +116,7 @@ def cmd_wait(args):
 
     cfg = load_config()
     templates = cfg.get("templates", {})
-    brief_template = templates.get("brief", "")
+    brief_template = templates.get("brief_wait") or templates.get("brief", "")
     item_template = templates.get("item", "")
     group_templates = templates.get("groups", {})
 
@@ -212,7 +212,7 @@ def cmd_peek(args):
 
     cfg = load_config()
     templates = cfg.get("templates", {})
-    brief_template = templates.get("brief", "")
+    brief_template = templates.get("brief_peek") or templates.get("brief", "")
     item_template = templates.get("item", "")
     group_templates = templates.get("groups", {})
 

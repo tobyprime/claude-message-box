@@ -64,6 +64,29 @@ def _default_config() -> dict[str, Any]:
 !{date "+%Y-%m-%d %H:%M:%S"}
 💡 向消息源回复，不要在对话中直接输出
 """,
+            "brief_wait": """## 📬 消息简报
+弹窗消息 ({POPUP_MESSAGE_COUNT}):
+{NEW_POPUP_MESSAGES}
+
+新消息 ({MESSAGE_COUNT}):
+{NEW_MESSAGES}
+
+!{date "+%Y-%m-%d %H:%M:%S"}
+💡 处理原则：
+1. 被私聊或在群聊中被 @ 时，先第一时间简短回应「收到，正在处理」，再执行任务。
+2. 处理消息时查看最近完整上下文，不要只看最新一条。
+3. 向消息源回复，不要在对话中直接输出。
+4. 复杂任务交给 subagent 或非交互式 claude 后台处理。
+5. 忙更高优先级事项时，首次回复说明状态，并视情况决定是否透露具体内容。
+6. 善用 todo/task 系统跟踪和管理任务。
+""",
+            "brief_peek": """## 📬 消息简报
+弹窗消息 ({POPUP_MESSAGE_COUNT}):
+{NEW_POPUP_MESSAGES}
+
+新消息 ({MESSAGE_COUNT}):
+{NEW_MESSAGES}
+""",
             "item": "• [{MESSAGE_TYPE}] {MESSAGE_TITLE} ({MESSAGE_TIME_AGO}): {MESSAGE_CONTENT_CUTTED}",
             "groups": {
                 "group_header": "[{GROUP_TYPE}]",

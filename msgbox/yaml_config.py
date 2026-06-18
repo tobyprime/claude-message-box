@@ -64,7 +64,7 @@ def _default_config() -> dict[str, Any]:
 !{date "+%Y-%m-%d %H:%M:%S"}
 💡 向消息源回复，不要在对话中直接输出
 """,
-            "item": "• [{MESSAGE_TYPE}] {MESSAGE_TITLE}: {MESSAGE_CONTENT_CUTTED}",
+            "item": "• [{MESSAGE_TYPE}] {MESSAGE_TITLE} ({MESSAGE_TIME_AGO}): {MESSAGE_CONTENT_CUTTED}",
         },
     }
 

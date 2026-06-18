@@ -7,10 +7,36 @@
 
 import re
 import subprocess
+from datetime import datetime, timezone
 from typing import Any
 
 
 _BUILTIN_VARS: dict[str, str] = {}
+
+
+def _relative_time(iso_str: str) -> str:
+    """将 ISO 时间字符串转为相对时间描述（几秒前/几分钟前/几小时前等）"""
+    try:
+        ts = datetime.fromisoformat(iso_str)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - ts
+        seconds = int(delta.total_seconds())
+    except (ValueError, TypeError):
+        return ""
+
+    if seconds < 5:
+        return "刚刚"
+    elif seconds < 60:
+        return f"{seconds}秒前"
+    elif seconds < 3600:
+        return f"{seconds // 60}分钟前"
+    elif seconds < 86400:
+        return f"{seconds // 3600}小时前"
+    elif seconds < 2592000:
+        return f"{seconds // 86400}天前"
+    else:
+        return f"{seconds // 2592000}月前"
 
 
 def set_builtin_vars(vars: dict[str, str]):
@@ -78,6 +104,8 @@ def _format_single_message(msg: dict, item_template: str, var_prefix: str = "") 
         f"{var_prefix}MESSAGE_CONTENT_CUTTED": content_cut,
         f"{var_prefix}MESSAGE_TYPE": msg.get("type", ""),
         f"{var_prefix}MESSAGE_CATEGORY": msg.get("category", ""),
+        f"{var_prefix}MESSAGE_TIME_AGO": _relative_time(msg.get("created_at", "")),
+        f"{var_prefix}MESSAGE_CREATED_AT": msg.get("created_at", ""),
     }
     return render(item_template, vars)
 

@@ -20,6 +20,7 @@ from . import session as session_db
 from .filter import classify_message
 from .sources.github import run_server, get_github_config
 from .sources.inbox import run_inbox_source
+from .sources.dingtalk import run_dingtalk_source
 from .template import render_brief
 from .yaml_config import add_rule, get_config_value, list_rules, load_config, remove_rule, set_config_value
 
@@ -478,6 +479,12 @@ def cmd_source_inbox(args):
     run_inbox_source(interval=args.interval, foreground=args.foreground)
 
 
+def cmd_source_dingtalk(args):
+    """Start the DingTalk notification poller via dws CLI."""
+    interval = args.interval if args.interval and args.interval > 0 else None
+    run_dingtalk_source(interval=interval, foreground=args.foreground)
+
+
 # ── msgbox history ──────────────────────────────────────────
 
 
@@ -574,6 +581,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--interval", "-i", type=int, default=30, help="Poll interval in seconds (default: 30)")
     sp.add_argument("--foreground", "-f", action="store_true", help="Run in foreground (default: daemon)")
     sp.set_defaults(func=cmd_source_inbox)
+
+    sp = sub.add_parser("source-dingtalk", help="Start DingTalk notification poller (dws CLI)")
+    sp.add_argument("--interval", "-i", type=int, default=0, help="Poll interval in seconds (default: DINGTALK_POLL_INTERVAL env or 15)")
+    sp.add_argument("--foreground", "-f", action="store_true", help="Run in foreground")
+    sp.set_defaults(func=cmd_source_dingtalk)
 
     sp = sub.add_parser("subscribe", help="Subscribe to thread notifications")
     sp.add_argument("thread_type", choices=["discussion", "issue", "pr"])

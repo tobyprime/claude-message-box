@@ -155,8 +155,18 @@ def poll_inbox(interval: int, stop_event: threading.Event):
     central_db.init_central_db(config.CENTRAL_DB)
     last_check = datetime.now(timezone.utc)
 
-    # Track seen notification URLs to avoid duplicates
+    # Restore seen URLs from existing inbox messages to avoid re-import on restart
     seen_urls: set[str] = set()
+    existing = central_db.get_messages(config.CENTRAL_DB, limit=500, type_pattern="github.*")
+    for ex in existing:
+        try:
+            ex_props = json.loads(ex.get("props", "{}")) if isinstance(ex.get("props"), str) else ex.get("props", {})
+            if ex_props.get("source") == "inbox" and ex_props.get("url"):
+                seen_urls.add(ex_props["url"])
+        except Exception:
+            pass
+    if seen_urls:
+        logger.info(f"Loaded {len(seen_urls)} seen inbox URLs from DB")
 
     # First run: fetch all unread notifications (no since filter)
     # Subsequent runs: only fetch since last check

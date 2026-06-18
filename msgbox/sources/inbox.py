@@ -68,9 +68,9 @@ def _fetch_notifications(since: str | None = None) -> list[dict]:
     Returns:
         List of notification dicts.
     """
-    args = ["gh", "api", "notifications", "--jq", "."]
+    args = ["gh", "api", "--method", "GET", "/notifications", "--jq", "."]
     if since:
-        args += ["--field", f"since={since}"]
+        args += ["--raw-field", f"since={since}"]
 
     try:
         result = subprocess.run(args, capture_output=True, text=True, timeout=15)
@@ -155,30 +155,32 @@ def poll_inbox(interval: int, stop_event: threading.Event):
     central_db.init_central_db(config.CENTRAL_DB)
     last_check = datetime.now(timezone.utc)
 
-    # Mark all existing notifications as seen on first run
-    since_ts = last_check.isoformat()
+    # Track seen notification URLs to avoid duplicates
+    seen_urls: set[str] = set()
+
+    # First run: fetch all unread notifications (no since filter)
+    # Subsequent runs: only fetch since last check
+    first_run = True
 
     while not stop_event.is_set():
         try:
+            since_ts = None if first_run else last_check.isoformat()
             notifications = _fetch_notifications(since_ts)
+            first_run = False
             now = datetime.now(timezone.utc)
-            since_ts = now.isoformat()
+            last_check = now
 
             for n in notifications:
-                # Skip own events (bot's own actions)
-                # Note: Notifications API doesn't directly expose sender,
-                # but we can check if the reason is "author" for our own actions
-                # We'll still insert "author" as normal, not skip entirely
-                # because "author" means we subscribed and something happened
-
                 msg = _map_notification(n)
                 if msg is None:
                     continue
 
-                # Dedup by checking if we already have this notification
-                # Use URL + updated_at as dedup key
-                props = msg.get("props", {})
-                props_json = json.dumps(props)
+                # Dedup: skip if same notification URL already seen
+                url = msg.get("props", {}).get("url", "")
+                if url:
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
 
                 # Insert into DB
                 category = classify_message(msg["type"], msg.get("props", {}))

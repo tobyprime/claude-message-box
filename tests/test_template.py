@@ -90,16 +90,18 @@ class TestFormatSingleMessage:
 
 class TestRenderBrief:
     def test_all_categories(self):
-        popups = [{"id": 1, "type": "alert", "title": "P1", "content": "pop", "category": "popup", "props": "{}"}]
-        normals = [{"id": 2, "type": "info", "title": "N1", "content": "norm", "category": "normal", "props": "{}"}]
-        silents = [{"id": 3, "type": "hb", "title": "S1", "content": "sil", "category": "silent", "props": "{}"}]
+        popups = [{"id": 1, "type": "alert", "title": "P1", "content": "pop", "category": "popup", "props": "{}", "created_at": "2026-01-01T00:00:00"}]
+        normals = [{"id": 2, "type": "info", "title": "N1", "content": "norm", "category": "normal", "props": "{}", "created_at": "2026-01-01T00:00:00"}]
+        silents = [{"id": 3, "type": "hb", "title": "S1", "content": "sil", "category": "silent", "props": "{}", "created_at": "2026-01-01T00:00:00"}]
 
         brief_tpl = "POPUP({POPUP_MESSAGE_COUNT}):{NEW_POPUP_MESSAGES}\nNORM({MESSAGE_COUNT}):{NEW_MESSAGES}\nSIL({SILENT_MESSAGE_COUNT}):{NEW_SILENT_MESSAGES}"
         item_tpl = " [{MESSAGE_TITLE}]"
 
         result = render_brief(brief_tpl, item_tpl, popups, normals, silents)
-        assert "POPUP(1): [P1]" in result
-        assert "NORM(1): [N1]" in result
+        assert "POPUP(1):[alert]" in result
+        assert " [P1]" in result
+        assert "NORM(1):[info]" in result
+        assert " [N1]" in result
         assert "SIL(1): [S1]" in result
 
     def test_empty(self):
@@ -107,7 +109,7 @@ class TestRenderBrief:
         assert result == "empty"
 
     def test_bash_in_brief(self):
-        popups = [{"id": 1, "type": "a", "title": "t", "content": "c", "category": "popup", "props": "{}"}]
+        popups = [{"id": 1, "type": "a", "title": "t", "content": "c", "category": "popup", "props": "{}", "created_at": "2026-01-01T00:00:00"}]
         result = render_brief("{POPUP_MESSAGE_COUNT} !{echo OK}", "{MESSAGE_TITLE}", popups, [], [])
         assert "1" in result
         assert "OK" in result

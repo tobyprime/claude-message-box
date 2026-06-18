@@ -193,7 +193,8 @@ class TestPollInbox:
         with (
             patch("msgbox.sources.inbox._fetch_notifications", return_value=[]),
             patch("msgbox.sources.inbox._get_self_user", return_value="tobylinas2"),
-            patch("msgbox.sources.inbox.central_db"),
+            patch("msgbox.sources.inbox.central_db.init_central_db"),
+            patch("msgbox.sources.inbox.central_db.message_exists_by_url", return_value=False),
         ):
             inbox.poll_inbox(30, stop)
             # Should not crash
@@ -218,6 +219,8 @@ class TestPollInbox:
         with (
             patch("msgbox.sources.inbox._fetch_notifications", return_value=[notif]),
             patch("msgbox.sources.inbox._get_self_user", return_value="tobylinas2"),
+            patch("msgbox.sources.inbox.central_db.init_central_db"),
+            patch("msgbox.sources.inbox.central_db.message_exists_by_url", return_value=False),
             patch("msgbox.sources.inbox.central_db.insert_message", return_value=1) as mock_insert,
         ):
             inbox.poll_inbox(30, stop)
@@ -243,6 +246,8 @@ class TestPollInbox:
         with (
             patch("msgbox.sources.inbox._fetch_notifications", return_value=[notif, notif]),
             patch("msgbox.sources.inbox._get_self_user", return_value="tobylinas2"),
+            patch("msgbox.sources.inbox.central_db.init_central_db"),
+            patch("msgbox.sources.inbox.central_db.message_exists_by_url", side_effect=[False, True]),
             patch("msgbox.sources.inbox.central_db.insert_message", return_value=1) as mock_insert,
         ):
             inbox.poll_inbox(30, stop)
@@ -256,6 +261,7 @@ class TestPollInbox:
         with (
             patch("msgbox.sources.inbox._fetch_notifications", side_effect=Exception("boom")),
             patch("msgbox.sources.inbox._get_self_user", return_value="tobylinas2"),
+            patch("msgbox.sources.inbox.central_db.init_central_db"),
         ):
             inbox.poll_inbox(30, stop)
             # Should not crash

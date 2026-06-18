@@ -119,6 +119,7 @@ def cmd_wait(args):
     templates = cfg.get("templates", {})
     brief_template = templates.get("brief", "")
     item_template = templates.get("item", "")
+    group_templates = templates.get("groups", {})
 
     excluded_ids = session_db.get_excluded_ids(db_path)
     done_ids = session_db.get_done_ids(db_path)
@@ -131,7 +132,7 @@ def cmd_wait(args):
     popup_count = central_db.get_unread_popup_count(config.CENTRAL_DB, done_ids)
     if popup_count > 0:
         popups = central_db.get_undelivered_messages(config.CENTRAL_DB, done_ids, ("popup",))
-        output = render_brief(brief_template, item_template, popups, [])
+        output = render_brief(brief_template, item_template, popups, [], group_templates=group_templates)
         print(output, file=sys.stderr)
         sys.exit(2)
 
@@ -150,7 +151,7 @@ def cmd_wait(args):
         if popups or msgs:
             if msgs:
                 session_db.mark_delivered(db_path, [m["id"] for m in msgs])
-            output = render_brief(brief_template, item_template, popups, msgs)
+            output = render_brief(brief_template, item_template, popups, msgs, group_templates=group_templates)
             print(output, file=sys.stderr)
             sys.exit(2)
 
@@ -202,6 +203,7 @@ def cmd_peek(args):
     templates = cfg.get("templates", {})
     brief_template = templates.get("brief", "")
     item_template = templates.get("item", "")
+    group_templates = templates.get("groups", {})
 
     excluded_ids = session_db.get_excluded_ids(db_path)
     new_msgs = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("popup", "normal"))
@@ -215,7 +217,7 @@ def cmd_peek(args):
     # peek：popup 自动标记已阅，只看一次；normal 也自动标记
     session_db.mark_delivered(db_path, [m["id"] for m in new_msgs])
 
-    output = render_brief(brief_template, item_template, popups, msgs)
+    output = render_brief(brief_template, item_template, popups, msgs, group_templates=group_templates)
     print(output, file=sys.stderr)
     sys.exit(2)
 
@@ -489,10 +491,12 @@ def cmd_history(args):
 
     cfg = load_config()
     templates = cfg.get("templates", {})
+    group_templates = templates.get("groups", {})
     output = render_brief(
         templates.get("brief", ""),
         templates.get("item", ""),
         popups, normals, silents,
+        group_templates=group_templates,
     )
     print(output)
     print(f"--- {len(msgs)} messages (offset={args.offset}) ---")

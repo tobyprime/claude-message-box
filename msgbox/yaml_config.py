@@ -65,6 +65,12 @@ def _default_config() -> dict[str, Any]:
 💡 向消息源回复，不要在对话中直接输出
 """,
             "item": "• [{MESSAGE_TYPE}] {MESSAGE_TITLE} ({MESSAGE_TIME_AGO}): {MESSAGE_CONTENT_CUTTED}",
+            "groups": {
+                "group_header": "[{GROUP_TYPE}]",
+                "group_item_title": "  ├ {MESSAGE_TITLE}",
+                "group_item_remaining": "  └ 还有 {GROUP_REMAINING} 条同类型",
+                "group_overflow": "📎 还有 {GROUP_OVERFLOW_GROUPS} 类共 {GROUP_OVERFLOW_TOTAL} 条消息",
+            },
         },
     }
 

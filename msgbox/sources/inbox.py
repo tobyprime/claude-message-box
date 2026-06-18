@@ -86,6 +86,24 @@ def _fetch_notifications(since: str | None = None) -> list[dict]:
         return []
 
 
+def _mark_notification_read(notif_id: str) -> bool:
+    """Mark a GitHub notification thread as read."""
+    if not notif_id:
+        return False
+    try:
+        result = subprocess.run(
+            ["gh", "api", "--method", "PATCH", f"/notifications/threads/{notif_id}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            logger.debug(f"Failed to mark notification {notif_id} read: {result.stderr.strip()[:200]}")
+            return False
+        return True
+    except Exception as exc:
+        logger.debug(f"Mark notification read error: {exc}")
+        return False
+
+
 def _map_notification(n: dict) -> dict | None:
     """Map a GitHub notification to a msgbox message dict."""
     repo = n.get("repository", {}).get("full_name", "unknown")
@@ -184,6 +202,8 @@ def poll_inbox(interval: int, stop_event: threading.Event):
                 )
                 if msg_id:
                     logger.debug(f"Inbox #{msg_id}: [{msg['type']}] {msg['title']} ({category})")
+                    # 标记 GitHub 通知为已读，避免重复轮询
+                    _mark_notification_read(msg.get("props", {}).get("notif_id", ""))
 
         except Exception as exc:
             logger.warning(f"Inbox poll error: {exc}")

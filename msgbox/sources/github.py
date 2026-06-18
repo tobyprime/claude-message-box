@@ -590,17 +590,23 @@ class WebhookHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length > 0 else b"{}"
 
-        event_type = self.headers.get("X-GitHub-Event", "unknown")
+        event_type = self.headers.get("X-GitHub-Event", "")
         delivery_id = self.headers.get("X-GitHub-Delivery", "")
+        dingtalk_event = self.headers.get("X-DingTalk-Event", "")
 
         try:
             payload = json.loads(body)
         except json.JSONDecodeError:
-            logger.warning(f"Invalid JSON body for {event_type} (delivery={delivery_id})")
+            logger.warning(f"Invalid JSON body for {event_type or dingtalk_event} (delivery={delivery_id})")
             self._respond(400, b'{"error":"invalid json"}\n')
             return
 
-        # ── Filtering ──────────────────────────────────────
+        # ── DingTalk events ────────────────────────────────
+        if dingtalk_event:
+            self._handle_dingtalk(dingtalk_event, payload)
+            return
+
+        # ── Filtering (GitHub) ──────────────────────────────
         repo_name = payload.get("repository", {}).get("full_name", "")
         sender = (payload.get("sender") or {}).get("login", "")
 
@@ -653,6 +659,72 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._respond(200, b'{"status":"github webhook endpoint ready"}\n')
         else:
             self._respond(404, b'{"error":"not found"}\n')
+
+    def _handle_dingtalk(self, event_type: str, payload: dict):
+        """Handle DingTalk events from the dingtalk.js source."""
+        source = "dingtalk"
+
+        if event_type == "channel_message":
+            sender = payload.get("senderNick") or payload.get("senderId") or "unknown"
+            conversation = payload.get("conversationTitle") or payload.get("conversationId") or "chat"
+            text = (payload.get("textContent") or "")
+
+            msg = {
+                "type": "dingtalk.message",
+                "title": f"DingTalk from {sender} in {conversation}",
+                "content": text[:300] or "(non-text message)",
+                "props": {
+                    "senderId": payload.get("senderId", ""),
+                    "senderNick": sender,
+                    "conversationId": payload.get("conversationId", ""),
+                    "conversationTitle": conversation,
+                    "conversationType": payload.get("conversationType", ""),
+                    "msgType": payload.get("msgType", ""),
+                    "source": source,
+                },
+            }
+
+            # @mentions → popup
+            category = "popup" if ("@" in text) else "normal"
+
+        elif event_type == "callback":
+            msg = {
+                "type": "dingtalk.callback",
+                "title": f"DingTalk callback: {payload.get('callbackType', 'unknown')}",
+                "content": json.dumps(payload)[:300],
+                "props": {
+                    "callbackType": payload.get("callbackType", ""),
+                    "source": source,
+                },
+            }
+            category = "popup"
+
+        else:
+            msg = {
+                "type": f"dingtalk.{event_type}",
+                "title": f"DingTalk {event_type}",
+                "content": json.dumps(payload)[:300],
+                "props": {"source": source},
+            }
+            category = classify_message(msg["type"], msg.get("props", {}))
+
+        try:
+            msg_id = central_db.insert_message(
+                config.CENTRAL_DB,
+                type_=msg["type"],
+                title=msg["title"],
+                content=msg["content"],
+                props=msg.get("props", {}),
+                category=category,
+                source=source,
+            )
+            logger.info(f"DingTalk #{msg_id}: [{msg['type']}] {msg['title']} ({category})")
+        except Exception as exc:
+            logger.error(f"Failed to store DingTalk message: {exc}")
+            self._respond(500, b'{"error":"db insert failed"}\n')
+            return
+
+        self._respond(201, json.dumps({"status": "ok", "id": msg_id}).encode())
 
 
 # ── Server lifecycle ───────────────────────────────────────────

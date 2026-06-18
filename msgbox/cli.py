@@ -470,6 +470,37 @@ def cmd_source_inbox(args):
     run_inbox_source(interval=args.interval, foreground=args.foreground)
 
 
+def cmd_source_dingtalk(args):
+    """Start the DingTalk stream client (Node.js)."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    client_id = args.client_id or ""
+    client_secret = args.client_secret or ""
+
+    if not client_id:
+        client_id = input("DingTalk Client ID: ").strip()
+    if not client_secret:
+        import getpass
+        client_secret = getpass.getpass("DingTalk Client Secret: ").strip()
+
+    if not client_id or not client_secret:
+        print("Client ID and Secret are required", file=sys.stderr)
+        sys.exit(1)
+
+    js_path = Path(__file__).parent / "sources" / "dingtalk.js"
+    if not js_path.exists():
+        js_path = Path("/opt/claude-message-box/msgbox/sources/dingtalk.js")
+
+    env = dict(os.environ)
+    env["DINGTALK_CLIENT_ID"] = client_id
+    env["DINGTALK_CLIENT_SECRET"] = client_secret
+
+    print(f"Starting DingTalk source...")
+    subprocess.run(["node", str(js_path)], env=env)
+
+
 # ── msgbox history ──────────────────────────────────────────
 
 
@@ -566,6 +597,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--interval", "-i", type=int, default=30, help="Poll interval in seconds (default: 30)")
     sp.add_argument("--foreground", "-f", action="store_true", help="Run in foreground (default: daemon)")
     sp.set_defaults(func=cmd_source_inbox)
+
+    sp = sub.add_parser("source-dingtalk", help="Start DingTalk stream client")
+    sp.add_argument("--client-id", help="DingTalk Client ID")
+    sp.add_argument("--client-secret", help="DingTalk Client Secret")
+    sp.add_argument("--foreground", "-f", action="store_true", help="Run in foreground")
+    sp.add_argument("--save-config", action="store_true", help="Save Client ID to config")
+    sp.set_defaults(func=cmd_source_dingtalk)
 
     sp = sub.add_parser("subscribe", help="Subscribe to thread notifications")
     sp.add_argument("thread_type", choices=["discussion", "issue", "pr"])

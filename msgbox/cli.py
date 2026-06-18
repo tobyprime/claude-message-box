@@ -498,7 +498,7 @@ def cmd_source_dingtalk(args):
     env["DINGTALK_CLIENT_SECRET"] = client_secret
 
     print(f"Starting DingTalk source...")
-    subprocess.run(["node", str(js_path)], env=env)
+    subprocess.run(["node", str(js_path), str(config.CENTRAL_DB)], env=env)
 
 
 # ── msgbox history ──────────────────────────────────────────

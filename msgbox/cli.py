@@ -45,13 +45,11 @@ def cmd_start(args):
     db_path = _session_db_path(sid)
     session_db.init_session_db(db_path)
 
-    # 新会话默认所有已有 popup 标记为 closed，避免历史消息刷屏
     central_db.init_central_db(config.CENTRAL_DB)
-    done = session_db.get_done_ids(db_path)
-    all_popups = central_db.get_all_popup_ids(config.CENTRAL_DB)
-    unclosed = all_popups - done
-    if unclosed:
-        session_db.mark_done(db_path, list(unclosed))
+
+    # 已阅水位线直接推到当前最大 id，避免历史 normal/popup 消息刷屏
+    max_id = central_db.get_max_message_id(config.CENTRAL_DB)
+    session_db.set_read_cursor(db_path, max_id)
 
     print(f"msg_box activated: session={sid}")
 
@@ -121,20 +119,35 @@ def cmd_wait(args):
     item_template = templates.get("item", "")
     group_templates = templates.get("groups", {})
 
-    excluded_ids = session_db.get_excluded_ids(db_path)
-    done_ids = session_db.get_done_ids(db_path)
     idle_duration = config.IDLE_DURATION
     sleep_duration = config.SLEEP_DURATION
 
+    def _collect_pending():
+        cursor = session_db.get_read_cursor(db_path)
+        open_popups = session_db.get_open_popups(db_path)
+        new_popups = central_db.get_messages_after(
+            config.CENTRAL_DB, cursor, ("popup",), excluded_ids=open_popups
+        )
+        open_popup_msgs = central_db.get_messages_by_ids(
+            config.CENTRAL_DB, list(open_popups)
+        )
+        popups = new_popups + open_popup_msgs
+        msgs = central_db.get_messages_after(config.CENTRAL_DB, cursor, ("normal",))
+        return popups, msgs
+
+    def _deliver(popups, msgs):
+        all_ids = [m["id"] for m in popups] + [m["id"] for m in msgs]
+        if all_ids:
+            cursor = session_db.get_read_cursor(db_path)
+            session_db.set_read_cursor(db_path, max(cursor, max(all_ids)))
+        if popups:
+            session_db.mark_popups_delivered(db_path, [m["id"] for m in popups])
+
     # Phase 1: 检查 popup（立即返回）
-    # popup 只用 done（close）过滤，不看 delivered（peek）
-    # 所以 peek 看过但没 close 的 popup 会继续弹出
-    popup_count = central_db.get_unread_popup_count(config.CENTRAL_DB, done_ids)
-    if popup_count > 0:
-        popups = central_db.get_undelivered_messages(config.CENTRAL_DB, done_ids, ("popup",))
-        # 标记为 delivered，供 msgbox close 识别已看过的 popup
-        session_db.mark_delivered(db_path, [m["id"] for m in popups])
-        output = render_brief(brief_template, item_template, popups, [], group_templates=group_templates)
+    popups, msgs = _collect_pending()
+    if popups:
+        _deliver(popups, msgs)
+        output = render_brief(brief_template, item_template, popups, msgs, group_templates=group_templates)
         print(output, file=sys.stderr)
         sys.exit(2)
 
@@ -145,16 +158,9 @@ def cmd_wait(args):
     while elapsed < total_duration:
         time.sleep(poll_interval)
         elapsed += poll_interval
-        excluded_ids = session_db.get_excluded_ids(db_path)
-        done_ids = session_db.get_done_ids(db_path)
-        # popup 只看 done，normal 看 delivered + done
-        popups = central_db.get_undelivered_messages(config.CENTRAL_DB, done_ids, ("popup",))
-        msgs = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("normal",))
+        popups, msgs = _collect_pending()
         if popups or msgs:
-            if popups:
-                session_db.mark_delivered(db_path, [m["id"] for m in popups])
-            if msgs:
-                session_db.mark_delivered(db_path, [m["id"] for m in msgs])
+            _deliver(popups, msgs)
             output = render_brief(brief_template, item_template, popups, msgs, group_templates=group_templates)
             print(output, file=sys.stderr)
             sys.exit(2)
@@ -209,17 +215,23 @@ def cmd_peek(args):
     item_template = templates.get("item", "")
     group_templates = templates.get("groups", {})
 
-    excluded_ids = session_db.get_excluded_ids(db_path)
-    new_msgs = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("popup", "normal"))
+    cursor = session_db.get_read_cursor(db_path)
+    open_popups = session_db.get_open_popups(db_path)
 
-    if not new_msgs:
+    new_popups = central_db.get_messages_after(
+        config.CENTRAL_DB, cursor, ("popup",), excluded_ids=open_popups
+    )
+    open_popup_msgs = central_db.get_messages_by_ids(config.CENTRAL_DB, list(open_popups))
+    popups = new_popups + open_popup_msgs
+    msgs = central_db.get_messages_after(config.CENTRAL_DB, cursor, ("normal",))
+
+    if not popups and not msgs:
         return
 
-    popups = [m for m in new_msgs if m["category"] == "popup"]
-    msgs = [m for m in new_msgs if m["category"] == "normal"]
-
-    # peek：popup 自动标记已阅，只看一次；normal 也自动标记
-    session_db.mark_delivered(db_path, [m["id"] for m in new_msgs])
+    all_ids = [m["id"] for m in popups] + [m["id"] for m in msgs]
+    session_db.set_read_cursor(db_path, max(cursor, max(all_ids)))
+    if popups:
+        session_db.mark_popups_delivered(db_path, [m["id"] for m in popups])
 
     output = render_brief(brief_template, item_template, popups, msgs, group_templates=group_templates)
     print(output, file=sys.stderr)
@@ -245,20 +257,15 @@ def cmd_close(args):
 
     if args.ids:
         msg_ids = [int(x) for x in args.ids.split(",")]
-        session_db.mark_done(db_path, msg_ids)
+        session_db.close_popups(db_path, msg_ids)
         print(f"Closed {len(msg_ids)} popup messages")
         return
 
-    # Close popups that have been peek-delivered but not yet closed
-    # 不关闭还没 peek 过的新 popup，避免新消息被误关
-    central_db.init_central_db(config.CENTRAL_DB)
-    done_ids = session_db.get_done_ids(db_path)
-    delivered_ids = session_db.get_delivered_ids(db_path)
-    all_popups = central_db.get_all_popup_ids(config.CENTRAL_DB)
-    unclosed_delivered = (all_popups - done_ids) & delivered_ids
-    if unclosed_delivered:
-        session_db.mark_done(db_path, list(unclosed_delivered))
-        print(f"Closed {len(unclosed_delivered)} popup messages")
+    # 默认只关闭已经 delivery 过的 popup
+    delivered_open = session_db.get_open_popups(db_path, delivered_only=True)
+    if delivered_open:
+        session_db.close_popups(db_path, list(delivered_open))
+        print(f"Closed {len(delivered_open)} popup messages")
         return
 
     print("No popup messages to close")
@@ -278,17 +285,18 @@ def cmd_mark_done(args):
         print("msg_box not active", file=sys.stderr)
         sys.exit(1)
 
+    session_db.init_session_db(db_path)
+
     if args.all:
-        session_db.init_session_db(db_path)
-        ids = session_db.get_excluded_ids(db_path)
-        if ids:
-            session_db.mark_done(db_path, list(ids))
-            print(f"Marked {len(ids)} messages as done")
+        open_popups = session_db.get_open_popups(db_path)
+        if open_popups:
+            session_db.close_popups(db_path, list(open_popups))
+            print(f"Marked {len(open_popups)} messages as done")
         else:
             print("No messages to mark")
     elif args.ids:
         msg_ids = [int(x) for x in args.ids.split(",")]
-        session_db.mark_done(db_path, msg_ids)
+        session_db.close_popups(db_path, msg_ids)
         print(f"Marked {len(msg_ids)} messages as done")
     else:
         print("Specify --ids or --all", file=sys.stderr)

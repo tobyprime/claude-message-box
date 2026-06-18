@@ -132,6 +132,8 @@ def cmd_wait(args):
     popup_count = central_db.get_unread_popup_count(config.CENTRAL_DB, done_ids)
     if popup_count > 0:
         popups = central_db.get_undelivered_messages(config.CENTRAL_DB, done_ids, ("popup",))
+        # 标记为 delivered，供 msgbox close 识别已看过的 popup
+        session_db.mark_delivered(db_path, [m["id"] for m in popups])
         output = render_brief(brief_template, item_template, popups, [], group_templates=group_templates)
         print(output, file=sys.stderr)
         sys.exit(2)
@@ -149,6 +151,8 @@ def cmd_wait(args):
         popups = central_db.get_undelivered_messages(config.CENTRAL_DB, done_ids, ("popup",))
         msgs = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded_ids, ("normal",))
         if popups or msgs:
+            if popups:
+                session_db.mark_delivered(db_path, [m["id"] for m in popups])
             if msgs:
                 session_db.mark_delivered(db_path, [m["id"] for m in msgs])
             output = render_brief(brief_template, item_template, popups, msgs, group_templates=group_templates)

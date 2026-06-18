@@ -307,8 +307,8 @@ class TestCmdClose:
 class TestCmdWaitPopupCloseFilter:
     """验证 wait 中 popup 只用 done 过滤"""
 
-    def test_popup_not_auto_delivered(self, activated_session, temp_central_db):
-        """wait 不自动标记 popup 为 delivered"""
+    def test_popup_auto_delivered_by_wait(self, activated_session, temp_central_db):
+        """wait 标记 popup 为 delivered（供 close 识别已看过）"""
         central_db.insert_message(str(config.CENTRAL_DB), "test", "Popup!", "", category="popup")
 
         with (
@@ -320,7 +320,7 @@ class TestCmdWaitPopupCloseFilter:
 
         sid, db_path = activated_session
         delivered = session_db.get_delivered_ids(db_path)
-        assert not delivered, "wait 不应自动 delivered popup"
+        assert len(delivered) == 1, "wait 应自动 delivered popup"
 
     def test_popup_closed_by_done_not_delivered(self, activated_session, temp_central_db):
         """popup 用 done 过滤，不是 delivered"""

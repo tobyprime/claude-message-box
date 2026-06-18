@@ -92,6 +92,70 @@ def render(text: str, extra_vars: dict[str, str] | None = None) -> str:
 # ── 消息简报变量构建 ────────────────────────────────────────
 
 
+def _render_grouped(messages: list[dict], item_template: str, max_groups: int = 3, max_per_group: int = 3) -> list[str]:
+    """按类型聚合展示消息，避免简报过长
+
+    策略：
+    - 按 type 分组，组内按 created_at 降序
+    - 最多展示 max_groups 个类型组
+    - 每组最多展示 max_per_group 条
+      - 第1条：完整格式（标题 + 内容）
+      - 第2条：只展示标题
+      - 第3+条：计数为「还有 N 条同类型」
+    - 超出的组显示「还有 N 类共 M 条消息」
+    """
+    if not messages:
+        return []
+
+    # Group by type
+    groups: dict[str, list[dict]] = {}
+    for m in messages:
+        msg_type = m.get("type", "unknown")
+        groups.setdefault(msg_type, []).append(m)
+
+    # Sort groups: latest message time descending
+    def _group_latest(msgs: list[dict]) -> str:
+        times = [m.get("created_at", "") for m in msgs if m.get("created_at")]
+        return max(times) if times else ""
+
+    sorted_types = sorted(groups.keys(), key=lambda t: _group_latest(groups[t]), reverse=True)
+
+    items: list[str] = []
+    total_remaining = 0
+
+    for i, msg_type in enumerate(sorted_types):
+        msgs = groups[msg_type]
+        msgs.sort(key=lambda m: m.get("created_at", ""), reverse=True)
+
+        if i < max_groups:
+            items.append(f"[{msg_type.replace('github.', '')}]")
+            for j, m in enumerate(msgs):
+                if j == 0:
+                    # Full format
+                    items.append(_format_single_message(m, item_template))
+                elif j == 1:
+                    # Title only
+                    title = m.get("title", "")
+                    items.append(f"  ├ {title}")
+                elif j == 2:
+                    # Title only
+                    title = m.get("title", "")
+                    items.append(f"  ├ {title}")
+                else:
+                    # Remaining count
+                    remaining_in_group = len(msgs) - j
+                    items.append(f"  └ 还有 {remaining_in_group} 条同类型")
+                    break
+        else:
+            total_remaining += len(msgs)
+
+    if total_remaining > 0:
+        remaining_groups = len(sorted_types) - max_groups
+        items.append(f"📎 还有 {remaining_groups} 类共 {total_remaining} 条消息")
+
+    return items
+
+
 def _format_single_message(msg: dict, item_template: str, var_prefix: str = "") -> str:
     """按 item_template 渲染单条消息"""
     content = msg.get("content", "")
@@ -117,9 +181,9 @@ def render_brief(
     normal_messages: list[dict],
     silent_messages: list[dict] | None = None,
 ) -> str:
-    """渲染消息简报"""
-    popup_items = [_format_single_message(m, item_template) for m in popup_messages]
-    normal_items = [_format_single_message(m, item_template) for m in normal_messages]
+    """渲染消息简报（按类型聚合展示）"""
+    popup_items = _render_grouped(popup_messages, item_template)
+    normal_items = _render_grouped(normal_messages, item_template)
     silent_items = [_format_single_message(m, item_template) for m in (silent_messages or [])]
 
     vars = {

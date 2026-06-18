@@ -43,6 +43,15 @@ def cmd_start(args):
         sys.exit(1)
     db_path = _session_db_path(sid)
     session_db.init_session_db(db_path)
+
+    # 新会话默认所有已有 popup 标记为 closed，避免历史消息刷屏
+    central_db.init_central_db(config.CENTRAL_DB)
+    done = session_db.get_done_ids(db_path)
+    all_popups = central_db.get_all_popup_ids(config.CENTRAL_DB)
+    unclosed = all_popups - done
+    if unclosed:
+        session_db.mark_done(db_path, list(unclosed))
+
     print(f"msg_box activated: session={sid}")
 
 

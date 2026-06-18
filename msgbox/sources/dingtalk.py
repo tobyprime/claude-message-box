@@ -101,8 +101,6 @@ def poll_unread_conversations() -> list[dict]:
     """未读会话 — 同时拉取最新消息内容"""
     data = _dws(["chat", "message", "list-unread-conversations"])
     items = _extract_items(data)
-    if not items:
-        return []
 
     # Fetch latest message for each conversation using lastMsgCreateAt
     for item in items:
@@ -135,6 +133,57 @@ def poll_unread_conversations() -> list[dict]:
                         newest = msgs[0]
                         item["_latest_content"] = (newest.get("content") or "")[:300]
                         item["_latest_sender"] = newest.get("sender", "")
+        except Exception:
+            pass
+    return items
+
+
+# 已知群聊列表（运行时积累，每次轮询拉取最新消息）
+_KNOWN_GROUP_IDS: set[str] = set()
+_KNOWN_GROUP_TITLES: dict[str, str] = {}
+
+
+def _register_group(conv_id: str, title: str):
+    """注册一个群聊，下次轮询会主动拉取它的最新消息。"""
+    if conv_id:
+        _KNOWN_GROUP_IDS.add(conv_id)
+        if title:
+            _KNOWN_GROUP_TITLES[conv_id] = title
+
+
+def _init_known_groups():
+    """初始化已知群聊（从 chat search 查找相关群聊）。"""
+    try:
+        # Search for groups containing our name
+        data = _dws(["chat", "search", "--query", "Alkaid"])
+        if data:
+            for g in (_extract_items(data) or []):
+                cid = g.get("openConversationId", "")
+                if cid:
+                    _register_group(cid, g.get("title", "群聊"))
+    except Exception:
+        pass
+
+
+def poll_known_groups() -> list[dict]:
+    """从已知群聊列表拉取最新消息"""
+    items = []
+    for conv_id in list(_KNOWN_GROUP_IDS):
+        try:
+            # Use current UTC time with forward=false (newest-first) and limit 5
+            now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            msg_data = _dws(["chat", "message", "list", "--group", conv_id, "--time", now_utc, "--forward", "false", "--limit", "5"])
+            if msg_data:
+                msgs = _extract_items(msg_data)
+                if msgs:
+                    m = msgs[0]
+                    items.append({
+                        "openConversationId": conv_id,
+                        "title": _KNOWN_GROUP_TITLES.get(conv_id, "群聊"),
+                        "singleChat": False,
+                        "_latest_content": (m.get("content") or "")[:300],
+                        "_latest_sender": m.get("sender", ""),
+                    })
         except Exception:
             pass
     return items
@@ -363,48 +412,71 @@ def _poll_and_insert(poll_fn, mapper_fn, seen_keys: set[str], poll_name: str):
 
 
 def _poll_unread(seen_keys: set[str]):
-    """Poll unread conversations and split into direct/group messages."""
+    """Poll unread conversations."""
     try:
         items = poll_unread_conversations()
         if not items:
             return
-        for item in items:
-            is_single = item.get("singleChat", False)
-            if is_single:
-                msg = map_direct_message(item)
-            else:
-                msg = map_group_message(item)
-            if msg is None:
-                continue
-            key = _dedup_key(msg)
-            if key and key in seen_keys:
-                continue
-            category = "normal"
-            try:
-                msg_id = central_db.insert_message(
-                    config.CENTRAL_DB,
-                    type_=msg["type"],
-                    title=msg["title"],
-                    content=msg["content"],
-                    props=msg.get("props", {}),
-                    category=category,
-                    source="dingtalk",
-                )
-                if msg_id:
-                    if key:
-                        seen_keys.add(key)
-                    logger.info(f"DingTalk #{msg_id}: [{msg['type']}] {msg['title']} ({category})")
-            except Exception as exc:
-                logger.debug(f"DingTalk insert error: {exc}")
+        _insert_conversation_items(items, seen_keys)
     except Exception as exc:
         logger.warning(f"DingTalk unread error: {exc}")
+
+
+def _poll_known_groups(seen_keys: set[str]):
+    """Poll known group chats (catch groups not in unread list)."""
+    try:
+        items = poll_known_groups()
+        if not items:
+            return
+        _insert_conversation_items(items, seen_keys)
+    except Exception as exc:
+        logger.warning(f"DingTalk known groups error: {exc}")
+
+
+def _insert_conversation_items(items: list[dict], seen_keys: set[str]):
+    """Insert conversation items (direct/group) into DB."""
+    for item in items:
+        is_single = item.get("singleChat", False)
+        if not is_single:
+            # Register group for future polling
+            cid = item.get("openConversationId", "")
+            title = item.get("title", "群聊")
+            _register_group(cid, title)
+        if is_single:
+            msg = map_direct_message(item)
+        else:
+            msg = map_group_message(item)
+        if msg is None:
+            continue
+        key = _dedup_key(msg)
+        if key and key in seen_keys:
+            continue
+        category = "normal"
+        try:
+            msg_id = central_db.insert_message(
+                config.CENTRAL_DB,
+                type_=msg["type"],
+                title=msg["title"],
+                content=msg["content"],
+                props=msg.get("props", {}),
+                category=category,
+                source="dingtalk",
+            )
+            if msg_id:
+                if key:
+                    seen_keys.add(key)
+                logger.info(f"DingTalk #{msg_id}: [{msg['type']}] {msg['title']} ({category})")
+        except Exception as exc:
+            logger.debug(f"DingTalk insert error: {exc}")
 
 
 def poll_dingtalk(interval: int, stop_event: threading.Event):
     """Main polling loop for all DingTalk sources."""
     central_db.init_central_db(config.CENTRAL_DB)
+    _init_known_groups()
 
     seen_keys: set[str] = set()
+    _init_known_groups()
 
     pollers: list[tuple[str, Any, Any]] = [
         ("pending_approvals", poll_pending_approvals, map_pending_approval),
@@ -414,18 +486,20 @@ def poll_dingtalk(interval: int, stop_event: threading.Event):
         ("reports", poll_inbox_reports, map_report),
     ]
 
-    # First run: insert all items
+    # First run: init known groups and insert all items
+    _init_known_groups()
     logger.info("DingTalk source first run...")
     for poll_name, poll_fn, mapper_fn in pollers:
         _poll_and_insert(poll_fn, mapper_fn, seen_keys, poll_name)
-    # Unread conversations -> split into direct/group
     _poll_unread(seen_keys)
+    _poll_known_groups(seen_keys)
 
     # Polling loop
     while not stop_event.is_set():
         for poll_name, poll_fn, mapper_fn in pollers:
             _poll_and_insert(poll_fn, mapper_fn, seen_keys, poll_name)
         _poll_unread(seen_keys)
+        _poll_known_groups(seen_keys)
         stop_event.wait(interval)
 
 
@@ -433,7 +507,6 @@ def run_dingtalk_source(interval: int | None = None, foreground: bool = True):
     """Start the DingTalk notification poller."""
     if interval is None or interval <= 0:
         interval = DEFAULT_POLL_INTERVAL
-    """Start the DingTalk notification poller."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",

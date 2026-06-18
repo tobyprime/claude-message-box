@@ -81,6 +81,19 @@ def poll_mentions() -> list[dict]:
     return _extract_items(data)
 
 
+def _resolve_user_id(title: str) -> str | None:
+    """Resolve a contact name/phone to userId via dws contact search."""
+    try:
+        data = _dws(["contact", "user", "search", "--keyword", title])
+        if data:
+            users = _extract_items(data)
+            if users:
+                return users[0].get("userId", "")
+    except Exception:
+        pass
+    return None
+
+
 def poll_unread_conversations() -> list[dict]:
     """未读会话 — 同时拉取最新消息内容"""
     data = _dws(["chat", "message", "list-unread-conversations"])
@@ -88,15 +101,22 @@ def poll_unread_conversations() -> list[dict]:
     if not items:
         return []
 
-    # Fetch latest message for group conversations
+    # Fetch latest message for each conversation
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     for item in items:
         conv_id = item.get("openConversationId", "")
         is_single = item.get("singleChat", False)
-        if not conv_id or is_single:
-            continue  # Single chat needs userId lookup, skip for now
+        if not conv_id:
+            continue
         try:
-            msg_data = _dws(["chat", "message", "list", "--group", conv_id, "--time", now_str, "--forward", "false", "--limit", "1"])
+            if is_single:
+                title = item.get("title", "")
+                user_id = _resolve_user_id(title)
+                if not user_id:
+                    continue
+                msg_data = _dws(["chat", "message", "list-direct", "--user", user_id, "--time", now_str, "--forward", "false", "--limit", "1"])
+            else:
+                msg_data = _dws(["chat", "message", "list", "--group", conv_id, "--time", now_str, "--forward", "false", "--limit", "1"])
             if msg_data:
                 msgs = _extract_items(msg_data)
                 if msgs:

@@ -49,7 +49,7 @@ def _extract_items(data: Any) -> list[dict]:
         # {result: {conversations: [...]}} or {result: [...]} or {result: {messages: [...]}}
         result = data.get("result")
         if isinstance(result, dict):
-            for key in ("conversations", "messages", "items", "list", "data", "records"):
+            for key in ("conversations", "messages", "groups", "items", "list", "data", "records"):
                 val = result.get(key)
                 if isinstance(val, list):
                     return val

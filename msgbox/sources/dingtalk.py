@@ -102,7 +102,9 @@ def poll_unread_conversations() -> list[dict]:
         return []
 
     # Fetch latest message for each conversation
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Use --forward false (newest first) with time in the past, limit 1
+    before_str = (datetime.now().timestamp() - 86400)  # 24 hours ago
+    before_str_fmt = datetime.fromtimestamp(before_str).strftime("%Y-%m-%d %H:%M:%S")
     for item in items:
         conv_id = item.get("openConversationId", "")
         is_single = item.get("singleChat", False)
@@ -114,14 +116,16 @@ def poll_unread_conversations() -> list[dict]:
                 user_id = _resolve_user_id(title)
                 if not user_id:
                     continue
-                msg_data = _dws(["chat", "message", "list-direct", "--user", user_id, "--time", now_str, "--forward", "false", "--limit", "1"])
+                msg_data = _dws(["chat", "message", "list-direct", "--user", user_id, "--time", before_str_fmt, "--forward", "false", "--limit", "5"])
             else:
-                msg_data = _dws(["chat", "message", "list", "--group", conv_id, "--time", now_str, "--forward", "false", "--limit", "1"])
+                msg_data = _dws(["chat", "message", "list", "--group", conv_id, "--time", before_str_fmt, "--forward", "false", "--limit", "5"])
             if msg_data:
                 msgs = _extract_items(msg_data)
                 if msgs:
-                    content = msgs[0].get("content", "")
-                    sender = msgs[0].get("sender", "")
+                    # Take the newest (first in newest-first order)
+                    newest = msgs[0]
+                    content = newest.get("content", "")
+                    sender = newest.get("sender", "")
                     item["_latest_content"] = content[:300] if content else ""
                     item["_latest_sender"] = sender
         except Exception:

@@ -242,10 +242,10 @@ def cmd_close(args):
         print(f"Closed {len(msg_ids)} popup messages")
         return
 
-    # Close all undelivered popup messages (the ones currently being shown)
+    # Close all popups not yet closed（只用 done 过滤，和 wait 一致）
     central_db.init_central_db(config.CENTRAL_DB)
-    excluded = session_db.get_excluded_ids(db_path)
-    popups = central_db.get_undelivered_messages(config.CENTRAL_DB, excluded, ("popup",))
+    done_ids = session_db.get_done_ids(db_path)
+    popups = central_db.get_undelivered_messages(config.CENTRAL_DB, done_ids, ("popup",))
     if popups:
         session_db.mark_done(db_path, [m["id"] for m in popups])
         print(f"Closed {len(popups)} popup messages")

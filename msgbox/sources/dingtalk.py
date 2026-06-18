@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -11,6 +12,9 @@ from typing import Any
 from .. import config
 from .. import db as central_db
 from ..filter import classify_message
+
+# 轮询间隔，默认 15 秒，可通过 DINGTALK_POLL_INTERVAL 环境变量覆盖
+DEFAULT_POLL_INTERVAL = int(os.environ.get("DINGTALK_POLL_INTERVAL", "15"))
 
 logger = logging.getLogger("msgbox.sources.dingtalk")
 
@@ -425,7 +429,10 @@ def poll_dingtalk(interval: int, stop_event: threading.Event):
         stop_event.wait(interval)
 
 
-def run_dingtalk_source(interval: int = 60, foreground: bool = True):
+def run_dingtalk_source(interval: int | None = None, foreground: bool = True):
+    """Start the DingTalk notification poller."""
+    if interval is None or interval <= 0:
+        interval = DEFAULT_POLL_INTERVAL
     """Start the DingTalk notification poller."""
     logging.basicConfig(
         level=logging.INFO,

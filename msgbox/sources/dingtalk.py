@@ -43,10 +43,10 @@ def _extract_items(data: Any) -> list[dict]:
             val = data.get(key)
             if isinstance(val, list):
                 return val
-        # {result: {conversations: [...]}} or {result: [...]}
+        # {result: {conversations: [...]}} or {result: [...]} or {result: {messages: [...]}}
         result = data.get("result")
         if isinstance(result, dict):
-            for key in ("conversations", "items", "list", "data", "records"):
+            for key in ("conversations", "messages", "items", "list", "data", "records"):
                 val = result.get(key)
                 if isinstance(val, list):
                     return val
@@ -82,9 +82,31 @@ def poll_mentions() -> list[dict]:
 
 
 def poll_unread_conversations() -> list[dict]:
-    """未读会话"""
+    """未读会话 — 同时拉取最新消息内容"""
     data = _dws(["chat", "message", "list-unread-conversations"])
-    return _extract_items(data)
+    items = _extract_items(data)
+    if not items:
+        return []
+
+    # Fetch latest message for group conversations
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for item in items:
+        conv_id = item.get("openConversationId", "")
+        is_single = item.get("singleChat", False)
+        if not conv_id or is_single:
+            continue  # Single chat needs userId lookup, skip for now
+        try:
+            msg_data = _dws(["chat", "message", "list", "--group", conv_id, "--time", now_str, "--forward", "false", "--limit", "1"])
+            if msg_data:
+                msgs = _extract_items(msg_data)
+                if msgs:
+                    content = msgs[0].get("content", "")
+                    sender = msgs[0].get("sender", "")
+                    item["_latest_content"] = content[:300] if content else ""
+                    item["_latest_sender"] = sender
+        except Exception:
+            pass
+    return items
 
 
 def poll_todo() -> list[dict]:
@@ -164,14 +186,22 @@ def map_mention(item: dict) -> dict | None:
 
 
 def map_unread_conversation(item: dict) -> dict | None:
-    """未读会话 → msgbox 消息"""
+    """未读会话 → msgbox 消息（含最新消息内容）"""
     title = item.get("title") or item.get("conversationTitle", "未读会话")
     unread = item.get("unreadPoint") or item.get("unreadCount", 0)
     conv_id = item.get("openConversationId") or item.get("conversationId", "")
+    latest_content = item.get("_latest_content", "")
+    latest_sender = item.get("_latest_sender", "")
+
+    if latest_content:
+        content = f"[{latest_sender}] {latest_content}" if latest_sender else latest_content
+    else:
+        content = f"{unread} 条未读消息"
+
     return {
         "type": "dingtalk.unread",
         "title": f"[未读] {title} ({unread}条)",
-        "content": f"{unread} 条未读消息",
+        "content": content[:300],
         "props": {
             "conversationId": conv_id,
             "title": title,

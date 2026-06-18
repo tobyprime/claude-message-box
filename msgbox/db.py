@@ -51,24 +51,35 @@ def init_central_db(db_path: str):
             title       TEXT    NOT NULL DEFAULT '',
             content     TEXT    NOT NULL DEFAULT '',
             category    TEXT    NOT NULL DEFAULT 'normal',
+            source      TEXT    NOT NULL DEFAULT '',
             created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_messages_created_at
             ON messages(created_at);
         CREATE INDEX IF NOT EXISTS idx_messages_category
             ON messages(category);
+        CREATE INDEX IF NOT EXISTS idx_messages_source
+            ON messages(source);
         """
         ),
     )
+    # Migration: add source column if missing (for existing DBs created before source column)
+    try:
+        _with_cursor(
+            db_path,
+            lambda c: c.execute("ALTER TABLE messages ADD COLUMN source TEXT NOT NULL DEFAULT '';"),
+        )
+    except Exception:
+        pass  # Column already exists
 
 
-def insert_message(db_path: str, type_: str, title: str, content: str, props: dict | None = None, category: str = "normal") -> int:
+def insert_message(db_path: str, type_: str, title: str, content: str, props: dict | None = None, category: str = "normal", source: str = "") -> int:
     init_central_db(db_path)
     row_id = _with_cursor(
         db_path,
         lambda c: c.execute(
-            "INSERT INTO messages (type, title, content, props, category) VALUES (?, ?, ?, ?, ?)",
-            [type_, title, content, json.dumps(props or {}), category],
+            "INSERT INTO messages (type, title, content, props, category, source) VALUES (?, ?, ?, ?, ?, ?)",
+            [type_, title, content, json.dumps(props or {}), category, source],
         ).lastrowid,
     )
     return row_id
@@ -139,6 +150,20 @@ def get_undelivered_messages(db_path: str, excluded_ids: set[int], categories: t
         lambda c: c.execute(sql, list(categories) + params + [limit]).fetchall(),
     )
     return [dict(r) for r in rows]
+
+
+def message_exists_by_url(db_path: str, source: str, url: str) -> bool:
+    """检查是否存在相同 source + url 的消息（用于去重）"""
+    if not url:
+        return False
+    row = _with_cursor(
+        db_path,
+        lambda c: c.execute(
+            "SELECT 1 FROM messages WHERE source=? AND props LIKE ? LIMIT 1",
+            [source, f"%{url}%"],
+        ).fetchone(),
+    )
+    return row is not None
 
 
 def get_messages(

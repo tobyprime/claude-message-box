@@ -636,6 +636,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 content=msg["content"],
                 props=msg.get("props", {}),
                 category=category,
+                source="github_hook",
             )
             logger.info(f"Stored #{msg_id}: [{msg['type']}] {msg['title']}")
         except Exception as exc:

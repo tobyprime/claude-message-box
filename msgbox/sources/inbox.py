@@ -154,35 +154,10 @@ def poll_inbox(interval: int, stop_event: threading.Event):
 
     # Initialize DB
     central_db.init_central_db(config.CENTRAL_DB)
-    last_check = datetime.now(timezone.utc)
-
-    # Restore seen URLs from existing inbox messages to avoid re-import on restart
-    seen_urls: set[str] = set()
-    existing = central_db.get_messages(config.CENTRAL_DB, limit=500, type_pattern="github.*")
-    for ex in existing:
-        try:
-            ex_props = json.loads(ex.get("props", "{}")) if isinstance(ex.get("props"), str) else ex.get("props", {})
-            if ex_props.get("source") == "inbox":
-                url = ex_props.get("url", "")
-                notif_id = ex_props.get("notif_id", "")
-                if url:
-                    seen_urls.add(url)
-                elif notif_id:
-                    seen_urls.add(f"id:{notif_id}")
-        except Exception:
-            pass
-    if seen_urls:
-        logger.info(f"Loaded {len(seen_urls)} seen inbox URLs from DB")
-
-    # First run: fetch all unread notifications (no since filter)
-    # Subsequent runs: only fetch since last check
-    first_run = True
 
     while not stop_event.is_set():
         try:
-            since_ts = None if first_run else last_check.isoformat()
-            notifications = _fetch_notifications(since_ts)
-            first_run = False
+            notifications = _fetch_notifications()
             now = datetime.now(timezone.utc)
             last_check = now
 
@@ -191,13 +166,10 @@ def poll_inbox(interval: int, stop_event: threading.Event):
                 if msg is None:
                     continue
 
-                # Dedup by notification ID (always unique) or URL
-                notif_id = n.get("id", "")
+                # DB-level dedup: skip if same source + URL already exists
                 url = msg.get("props", {}).get("url", "")
-                dedup_key = url or f"id:{notif_id}"
-                if dedup_key in seen_urls:
+                if url and central_db.message_exists_by_url(config.CENTRAL_DB, "github_notif", url):
                     continue
-                seen_urls.add(dedup_key)
 
                 # Insert into DB
                 category = classify_message(msg["type"], msg.get("props", {}))
@@ -208,6 +180,7 @@ def poll_inbox(interval: int, stop_event: threading.Event):
                     content=msg["content"],
                     props=msg.get("props", {}),
                     category=category,
+                    source="github_notif",
                 )
                 if msg_id:
                     logger.debug(f"Inbox #{msg_id}: [{msg['type']}] {msg['title']} ({category})")

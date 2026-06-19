@@ -219,6 +219,7 @@ def cmd_wait(args):
     # Phase 2+3: 单循环轮询（先 idle 区间，后 sleep 区间）
     elapsed = 0
     poll_interval = 5
+    batch_window = config.WAIT_BATCH_WINDOW
     total_duration = idle_duration + sleep_duration
     while elapsed < total_duration:
         time.sleep(poll_interval)
@@ -245,6 +246,20 @@ def cmd_wait(args):
 
         popups, msgs = _collect_pending()
         if popups or msgs:
+            # 首次检测到消息后，进入短缓冲窗口继续收集同批次消息
+            buffer_deadline = time.monotonic() + batch_window
+            while time.monotonic() < buffer_deadline:
+                remaining = buffer_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(remaining, 0.1))
+                more_popups, more_msgs = _collect_pending()
+                if more_popups:
+                    popups = more_popups
+                    msgs = more_msgs
+                    break
+                if more_msgs:
+                    msgs = more_msgs
             _deliver(popups, msgs)
             output = render_brief(
                 brief_template, item_template, popups, msgs,

@@ -130,6 +130,7 @@ class TestCmdWaitPopups:
         with (
             patch.object(config, "IDLE_DURATION", 10),
             patch.object(config, "SLEEP_DURATION", 10),
+            patch.object(config, "WAIT_BATCH_WINDOW", 0),
             patch("msgbox.cli.central_db.get_messages_after", side_effect=mock_get_messages_after),
             patch("msgbox.cli.central_db.get_messages_by_ids", return_value=[]),
             patch("msgbox.cli.time.sleep"),
@@ -139,6 +140,67 @@ class TestCmdWaitPopups:
                 cli.cmd_wait(None)
 
             mock_exit.assert_called_once_with(2)
+
+    def test_batch_window_collects_more_messages(self, activated_session, temp_central_db):
+        """检测到第一条消息后，缓冲窗口期内继续收集后续消息"""
+        batch_window = 0.3
+        # Phase1 什么都不返回；轮询第1次sleep后只返回id=1；之后返回id=2
+        phase = [0]  # 0=Phase1, 1=first poll cycle, 2=buffer window
+
+        def mock_get_messages_after(*args, **kwargs):
+            p = phase[0]
+            if p == 0:
+                return []
+            elif p == 1:
+                return [{"id": 1, "category": "normal", "type": "test", "title": "First", "content": "", "props": {}}]
+            else:
+                return [{"id": 2, "category": "normal", "type": "test", "title": "Second", "content": "", "props": {}}]
+
+        delivered_ids = []
+
+        def capture_deliver(db_path, cursor):
+            delivered_ids.append(cursor)
+
+        monotonic_values = [
+            0,      # 0: wait_start
+            5.0,    # 1: first poll cycle begins — elapsed check (current_wait_elapsed)
+        ]
+        mono_idx = [0]
+
+        def fake_monotonic():
+            nonlocal mono_idx
+            idx = mono_idx[0]
+            mono_idx[0] += 1
+            if idx < len(monotonic_values):
+                return monotonic_values[idx]
+            # 超出剩余值：模拟时间在缓冲窗口内缓慢推进
+            v = 5.0001 + (mono_idx[0] - len(monotonic_values)) * 0.05
+            return v
+
+        def fake_sleep(sec):
+            if sec >= 5:  # 主轮询 sleep，切换 phase
+                phase[0] = 1
+            # 短 sleep（缓冲窗口内），切换 phase
+            if sec <= 0.1 and phase[0] == 1:
+                phase[0] = 2
+
+        with (
+            patch.object(config, "IDLE_DURATION", 10),
+            patch.object(config, "SLEEP_DURATION", 10),
+            patch.object(config, "WAIT_BATCH_WINDOW", batch_window),
+            patch("msgbox.cli.central_db.get_messages_after", side_effect=mock_get_messages_after),
+            patch("msgbox.cli.central_db.get_messages_by_ids", return_value=[]),
+            patch("msgbox.cli.time.sleep", side_effect=fake_sleep),
+            patch("msgbox.cli.time.monotonic", side_effect=fake_monotonic),
+            patch("msgbox.cli.session_db.set_read_cursor", side_effect=capture_deliver),
+            patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit,
+        ):
+            with pytest.raises(SystemExit):
+                cli.cmd_wait(None)
+
+            mock_exit.assert_called_once_with(2)
+            assert delivered_ids, "应有消息被交付"
+            assert max(delivered_ids) >= 2, f"缓冲窗口应收集到 id>=2 的消息，实际 cursor={delivered_ids}"
 
 
 class TestCmdWaitExitConditions:

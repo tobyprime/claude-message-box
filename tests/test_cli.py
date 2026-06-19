@@ -1,5 +1,6 @@
 """测试 CLI 命令 - 重点关注 cmd_wait/peek 行为"""
 
+import contextlib
 import os
 import tempfile
 from pathlib import Path
@@ -11,6 +12,11 @@ from msgbox import cli
 from msgbox import config
 from msgbox import db as central_db
 from msgbox import session as session_db
+
+# All cmd_* functions now live in msgbox/commands/ submodules.
+# They use from-X-import-Y so patches must target the consuming namespace.
+_MESSAGE = "msgbox.commands.message"
+_SESSION = "msgbox.commands.session"
 
 
 # ── 辅助 Fixtures ────────────────────────────────────────────
@@ -37,22 +43,34 @@ def temp_central_db():
 
 
 @pytest.fixture
-def activated_session(temp_sessions_dir, temp_central_db):
-    """创建一个已激活的 session（使用隔离的中央 DB）"""
-    sid = "test-session-12345"
-    with patch("msgbox.cli._session_id", return_value=sid), patch(
-        "msgbox.cli._is_main_agent", return_value=True
-    ):
-        db_path = cli._session_db_path(sid)
-        session_db.init_session_db(db_path)
-        yield sid, db_path
+def sid():
+    return "test-session-12345"
 
 
 @pytest.fixture
-def as_main_agent():
-    """强制当前进程视为主 agent，避免测试环境变量影响。"""
-    with patch("msgbox.cli._is_main_agent", return_value=True):
-        yield
+def activated_session(temp_sessions_dir, temp_central_db, sid):
+    """创建一个已激活的 session DB（不移除，由测试自行清理）。"""
+    db_path = cli._session_db_path(sid)
+    session_db.init_session_db(db_path)
+    return sid, db_path
+
+
+# ── 辅助 context manager 工厂 ─────────────────────────────────
+
+
+def _with_session(session_id: str, *extra_patches):
+    """组合常见的 session + main-agent patch。"""
+    ctx = (
+        patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": session_id}, clear=False),
+        patch(f"{_MESSAGE}._is_main_agent", return_value=True),
+    ) + extra_patches
+    return contextlib.ExitStack() if not extra_patches else contextlib.ExitStack()  # noqa
+
+
+import contextlib
+
+
+# ── TestCmdWaitDuration ──────────────────────────────────────
 
 
 class TestCmdWaitDuration:
@@ -67,14 +85,14 @@ class TestCmdWaitDuration:
         with (
             patch.object(config, "IDLE_DURATION", idle),
             patch.object(config, "SLEEP_DURATION", sleep),
-            patch("msgbox.cli._session_id", return_value="test"),
-            patch("msgbox.cli._is_main_agent", return_value=True),
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "test"}, clear=False),
+            patch(f"{_MESSAGE}._is_main_agent", return_value=True),
             patch.object(Path, "exists", return_value=True),
-            patch("msgbox.cli.session_db") as mock_session_db,
-            patch("msgbox.cli.central_db") as mock_central_db,
-            patch("msgbox.cli.load_config", return_value={"templates": {}}),
-            patch("msgbox.cli.time.sleep", side_effect=_sleep),
-            patch("msgbox.cli.sys.exit", side_effect=SystemExit),
+            patch(f"{_MESSAGE}.session_db") as mock_session_db,
+            patch(f"{_MESSAGE}.central_db") as mock_central_db,
+            patch(f"{_MESSAGE}.load_config", return_value={"templates": {}}),
+            patch(f"{_MESSAGE}.time.sleep", side_effect=_sleep),
+            patch(f"{_MESSAGE}.sys.exit", side_effect=SystemExit),
         ):
             mock_session_db.get_read_cursor.return_value = 0
             mock_session_db.get_open_popups.return_value = set()
@@ -100,16 +118,21 @@ class TestCmdWaitDuration:
         assert count == 4, f"idle+sleep=20s → 4 次，实际 {count}"
 
 
+# ── TestCmdWaitPopups ────────────────────────────────────────
+
+
 class TestCmdWaitPopups:
     """验证 cmd_wait 在 popup 存在时的行为"""
 
-    def test_popup_exit_2_with_stderr(self, activated_session, temp_central_db):
+    def test_popup_exit_2_with_stderr(self, activated_session, temp_central_db, sid):
         """有 popup 消息时打印到 stderr 并 exit(2)"""
         central_db.insert_message(str(config.CENTRAL_DB), "test.type", "Popup!", "urgent", category="popup")
 
         with (
-            patch("msgbox.cli.time.sleep") as mock_sleep,
-            patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit,
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False),
+            patch(f"{_MESSAGE}._is_main_agent", return_value=True),
+            patch(f"{_MESSAGE}.time.sleep") as mock_sleep,
+            patch(f"{_MESSAGE}.sys.exit", side_effect=SystemExit) as mock_exit,
         ):
             with pytest.raises(SystemExit):
                 cli.cmd_wait(None)
@@ -117,7 +140,7 @@ class TestCmdWaitPopups:
             assert not mock_sleep.called, "有 popup 不应轮询"
             mock_exit.assert_called_once_with(2)
 
-    def test_no_popup_polling_finds_message(self, activated_session, temp_central_db):
+    def test_no_popup_polling_finds_message(self, activated_session, temp_central_db, sid):
         """无 popup 时进入轮询，中途有消息应 exit(2)"""
         call_count = [0]
 
@@ -128,24 +151,25 @@ class TestCmdWaitPopups:
             return []
 
         with (
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False),
+            patch(f"{_MESSAGE}._is_main_agent", return_value=True),
             patch.object(config, "IDLE_DURATION", 10),
             patch.object(config, "SLEEP_DURATION", 10),
             patch.object(config, "WAIT_BATCH_WINDOW", 0),
-            patch("msgbox.cli.central_db.get_messages_after", side_effect=mock_get_messages_after),
-            patch("msgbox.cli.central_db.get_messages_by_ids", return_value=[]),
-            patch("msgbox.cli.time.sleep"),
-            patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit,
+            patch(f"{_MESSAGE}.central_db.get_messages_after", side_effect=mock_get_messages_after),
+            patch(f"{_MESSAGE}.central_db.get_messages_by_ids", return_value=[]),
+            patch(f"{_MESSAGE}.time.sleep"),
+            patch(f"{_MESSAGE}.sys.exit", side_effect=SystemExit) as mock_exit,
         ):
             with pytest.raises(SystemExit):
                 cli.cmd_wait(None)
 
             mock_exit.assert_called_once_with(2)
 
-    def test_batch_window_collects_more_messages(self, activated_session, temp_central_db):
+    def test_batch_window_collects_more_messages(self, activated_session, temp_central_db, sid):
         """检测到第一条消息后，缓冲窗口期内继续收集后续消息"""
         batch_window = 0.3
-        # Phase1 什么都不返回；轮询第1次sleep后只返回id=1；之后返回id=2
-        phase = [0]  # 0=Phase1, 1=first poll cycle, 2=buffer window
+        phase = [0]
 
         def mock_get_messages_after(*args, **kwargs):
             p = phase[0]
@@ -161,39 +185,34 @@ class TestCmdWaitPopups:
         def capture_deliver(db_path, cursor):
             delivered_ids.append(cursor)
 
-        monotonic_values = [
-            0,      # 0: wait_start
-            5.0,    # 1: first poll cycle begins — elapsed check (current_wait_elapsed)
-        ]
+        monotonic_values = [0, 5.0]
         mono_idx = [0]
 
         def fake_monotonic():
-            nonlocal mono_idx
             idx = mono_idx[0]
             mono_idx[0] += 1
             if idx < len(monotonic_values):
                 return monotonic_values[idx]
-            # 超出剩余值：模拟时间在缓冲窗口内缓慢推进
-            v = 5.0001 + (mono_idx[0] - len(monotonic_values)) * 0.05
-            return v
+            return 5.0001 + (mono_idx[0] - len(monotonic_values)) * 0.05
 
         def fake_sleep(sec):
-            if sec >= 5:  # 主轮询 sleep，切换 phase
+            if sec >= 5:
                 phase[0] = 1
-            # 短 sleep（缓冲窗口内），切换 phase
             if sec <= 0.1 and phase[0] == 1:
                 phase[0] = 2
 
         with (
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False),
+            patch(f"{_MESSAGE}._is_main_agent", return_value=True),
             patch.object(config, "IDLE_DURATION", 10),
             patch.object(config, "SLEEP_DURATION", 10),
             patch.object(config, "WAIT_BATCH_WINDOW", batch_window),
-            patch("msgbox.cli.central_db.get_messages_after", side_effect=mock_get_messages_after),
-            patch("msgbox.cli.central_db.get_messages_by_ids", return_value=[]),
-            patch("msgbox.cli.time.sleep", side_effect=fake_sleep),
-            patch("msgbox.cli.time.monotonic", side_effect=fake_monotonic),
-            patch("msgbox.cli.session_db.set_read_cursor", side_effect=capture_deliver),
-            patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit,
+            patch(f"{_MESSAGE}.central_db.get_messages_after", side_effect=mock_get_messages_after),
+            patch(f"{_MESSAGE}.central_db.get_messages_by_ids", return_value=[]),
+            patch(f"{_MESSAGE}.time.sleep", side_effect=fake_sleep),
+            patch(f"{_MESSAGE}.time.monotonic", side_effect=fake_monotonic),
+            patch(f"{_MESSAGE}.session_db.set_read_cursor", side_effect=capture_deliver),
+            patch(f"{_MESSAGE}.sys.exit", side_effect=SystemExit) as mock_exit,
         ):
             with pytest.raises(SystemExit):
                 cli.cmd_wait(None)
@@ -208,28 +227,32 @@ class TestCmdWaitExitConditions:
 
     def test_no_session_id(self):
         """没有 session_id 时静默 exit(0)"""
-        with patch("msgbox.cli._session_id", return_value=None):
-            with patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit:
+        with patch.dict(os.environ, clear=True):
+            with patch(f"{_MESSAGE}.sys.exit", side_effect=SystemExit) as mock_exit:
                 with pytest.raises(SystemExit):
                     cli.cmd_wait(None)
                 mock_exit.assert_called_once_with(0)
 
     def test_no_session_db(self):
         """session DB 不存在时静默 exit(0)"""
-        with patch("msgbox.cli._session_id", return_value="no-such-session"):
-            with patch.object(Path, "exists", return_value=False):
-                with patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit:
-                    with pytest.raises(SystemExit):
-                        cli.cmd_wait(None)
-                    mock_exit.assert_called_once_with(0)
+        with (
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "no-such-session"}, clear=False),
+            patch.object(Path, "exists", return_value=False),
+            patch(f"{_MESSAGE}.sys.exit", side_effect=SystemExit) as mock_exit,
+        ):
+            with pytest.raises(SystemExit):
+                cli.cmd_wait(None)
+            mock_exit.assert_called_once_with(0)
 
-    def test_no_messages_exit_2(self, activated_session):
+    def test_no_messages_exit_2(self, activated_session, sid):
         """无消息到达时 exit(2)"""
         with (
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False),
+            patch(f"{_MESSAGE}._is_main_agent", return_value=True),
             patch.object(config, "IDLE_DURATION", 1),
             patch.object(config, "SLEEP_DURATION", 1),
-            patch("msgbox.cli.time.sleep"),
-            patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit,
+            patch(f"{_MESSAGE}.time.sleep"),
+            patch(f"{_MESSAGE}.sys.exit", side_effect=SystemExit) as mock_exit,
         ):
             with pytest.raises(SystemExit):
                 cli.cmd_wait(None)
@@ -238,9 +261,9 @@ class TestCmdWaitExitConditions:
     def test_child_agent_silent(self):
         """子 agent 不应触发 wait 提醒"""
         with (
-            patch("msgbox.cli._session_id", return_value="test"),
-            patch("msgbox.cli._is_main_agent", return_value=False),
-            patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit,
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "test"}, clear=False),
+            patch(f"{_MESSAGE}._is_main_agent", return_value=False),
+            patch(f"{_MESSAGE}.sys.exit", side_effect=SystemExit) as mock_exit,
         ):
             with pytest.raises(SystemExit):
                 cli.cmd_wait(None)
@@ -250,34 +273,40 @@ class TestCmdWaitExitConditions:
 class TestCmdPeek:
     """验证 cmd_peek 行为"""
 
-    def test_peek_exit_2_with_stderr(self, activated_session, temp_central_db):
+    def test_peek_exit_2_with_stderr(self, activated_session, temp_central_db, sid):
         """有消息时 peek 打印到 stderr 并 exit(2)"""
         central_db.insert_message(str(config.CENTRAL_DB), "test", "Peek msg", "content", category="normal")
 
-        with patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit:
+        with (
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False),
+            patch(f"{_MESSAGE}._is_main_agent", return_value=True),
+            patch(f"{_MESSAGE}.sys.exit", side_effect=SystemExit) as mock_exit,
+        ):
             with pytest.raises(SystemExit):
                 cli.cmd_peek(None)
             mock_exit.assert_called_once_with(2)
 
-    def test_peek_no_messages_silent(self, activated_session, temp_central_db):
+    def test_peek_no_messages_silent(self, activated_session, temp_central_db, sid):
         """无消息时 peek 静默 exit(0)"""
-        with patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit:
+        with (
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False),
+            patch(f"{_MESSAGE}._is_main_agent", return_value=True),
+            patch(f"{_MESSAGE}.sys.exit", side_effect=SystemExit) as mock_exit,
+        ):
             cli.cmd_peek(None)
             assert not mock_exit.called, "无消息不应 exit"
 
-    def test_peek_cooldown(self, temp_sessions_dir):
+    def test_peek_cooldown(self, temp_sessions_dir, sid):
         """peek 冷却机制正常工作"""
-        sid = "peek-test"
         cooldown_file = Path(temp_sessions_dir) / f"{sid}.peek_ts"
 
         with (
-            patch("msgbox.cli._session_id", return_value=sid),
-            patch("msgbox.cli._is_main_agent", return_value=True),
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False),
+            patch(f"{_MESSAGE}._is_main_agent", return_value=True),
             patch.object(config, "PEEK_COOLDOWN", 10),
         ):
             cli.cmd_peek(None)
             assert cooldown_file.exists(), "peek 后应创建冷却文件"
-            # 立即再 peek 不应报错
             cli.cmd_peek(None)
 
     def test_peek_child_agent_silent(self, temp_sessions_dir):
@@ -286,8 +315,8 @@ class TestCmdPeek:
         cooldown_file = Path(temp_sessions_dir) / f"{sid}.peek_ts"
 
         with (
-            patch("msgbox.cli._session_id", return_value=sid),
-            patch("msgbox.cli._is_main_agent", return_value=False),
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False),
+            patch(f"{_MESSAGE}._is_main_agent", return_value=False),
             patch.object(config, "PEEK_COOLDOWN", 10),
         ):
             cli.cmd_peek(None)
@@ -307,14 +336,14 @@ class TestCmdWaitRegressions:
                     sleep_count[0] += 1
 
                 with (
-                    patch("msgbox.cli._session_id", return_value="reg-test"),
-                    patch("msgbox.cli._is_main_agent", return_value=True),
+                    patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "reg-test"}, clear=False),
+                    patch(f"{_MESSAGE}._is_main_agent", return_value=True),
                     patch.object(Path, "exists", return_value=True),
-                    patch("msgbox.cli.session_db") as mock_session_db,
-                    patch("msgbox.cli.central_db") as mock_central_db,
-                    patch("msgbox.cli.load_config", return_value={"templates": {}}),
-                    patch("msgbox.cli.time.sleep", side_effect=_sleep),
-                    patch("msgbox.cli.sys.exit", side_effect=SystemExit),
+                    patch(f"{_MESSAGE}.session_db") as mock_session_db,
+                    patch(f"{_MESSAGE}.central_db") as mock_central_db,
+                    patch(f"{_MESSAGE}.load_config", return_value={"templates": {}}),
+                    patch(f"{_MESSAGE}.time.sleep", side_effect=_sleep),
+                    patch(f"{_MESSAGE}.sys.exit", side_effect=SystemExit),
                 ):
                     mock_session_db.get_read_cursor.return_value = 0
                     mock_session_db.get_open_popups.return_value = set()
@@ -324,21 +353,21 @@ class TestCmdWaitRegressions:
                     with pytest.raises(SystemExit):
                         cli.cmd_wait(None)
 
-                    # idle+sleep=15s → 15/5=3 次 sleep
                     assert sleep_count[0] == 3, f"预期 3 次 sleep，实际 {sleep_count[0]}"
 
-    def test_output_goes_to_stderr(self, activated_session, temp_central_db):
+    def test_output_goes_to_stderr(self, activated_session, temp_central_db, sid):
         """验证输出写到 stderr"""
         central_db.insert_message(str(config.CENTRAL_DB), "test", "Popup!", "", category="popup")
 
         with (
-            patch("msgbox.cli.sys.exit", side_effect=SystemExit),
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False),
+            patch(f"{_MESSAGE}._is_main_agent", return_value=True),
+            patch(f"{_MESSAGE}.sys.exit", side_effect=SystemExit),
             patch("builtins.print") as mock_print,
         ):
             with pytest.raises(SystemExit):
                 cli.cmd_wait(None)
 
-            # 确保 print 调用了 file=sys.stderr
             assert any(
                 kw.get("file") is not None for _, kw in mock_print.call_args_list
             ), "输出应到 stderr"
@@ -353,7 +382,7 @@ class TestCmdStartAutoClose:
         central_db.insert_message(str(config.CENTRAL_DB), "test", "Old popup", "", category="popup")
         central_db.insert_message(str(config.CENTRAL_DB), "test", "Normal msg", "", category="normal")
 
-        with patch("msgbox.cli._session_id", return_value=sid):
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False):
             cli.cmd_start(None)
 
         db_path = cli._session_db_path(sid)
@@ -365,14 +394,15 @@ class TestCmdStartAutoClose:
         sid = "new-session"
         central_db.insert_message(str(config.CENTRAL_DB), "test", "Old normal", "", category="normal")
 
-        with patch("msgbox.cli._session_id", return_value=sid):
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False):
             cli.cmd_start(None)
 
         with (
-            patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit,
-            patch("msgbox.cli._touch_peek_cooldown"),
-            patch("msgbox.cli._check_peek_cooldown", return_value=False),
-            patch("msgbox.cli._is_main_agent", return_value=True),
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False),
+            patch(f"{_MESSAGE}._is_main_agent", return_value=True),
+            patch(f"{_MESSAGE}.sys.exit", side_effect=SystemExit) as mock_exit,
+            patch(f"{_MESSAGE}._touch_peek_cooldown"),
+            patch(f"{_MESSAGE}._check_peek_cooldown", return_value=False),
         ):
             cli.cmd_peek(None)
             assert not mock_exit.called, "历史消息不应触发 exit"
@@ -381,75 +411,72 @@ class TestCmdStartAutoClose:
 class TestCmdClose:
     """验证 cmd_close 行为"""
 
-    def test_close_by_ids(self, activated_session, temp_central_db):
+    def test_close_by_ids(self, activated_session, sid):
         """按 ID close 消息"""
-        sid, db_path = activated_session
+        _, db_path = activated_session
         msg_id = central_db.insert_message(str(config.CENTRAL_DB), "test", "Popup!", "", category="popup")
-
         args = MagicMock(ids=f"{msg_id}")
 
-        with patch("msgbox.cli._session_id", return_value=sid):
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False):
             cli.cmd_close(args)
 
         assert session_db.get_open_popups(db_path) == set()
 
-    def test_close_only_delivered_open_popups(self, activated_session, temp_central_db):
+    def test_close_only_delivered_open_popups(self, activated_session, sid):
         """默认只 close 已经 delivery 过的 popup"""
-        sid, db_path = activated_session
+        _, db_path = activated_session
         p1 = central_db.insert_message(str(config.CENTRAL_DB), "test", "P1", "", category="popup")
         p2 = central_db.insert_message(str(config.CENTRAL_DB), "test", "P2", "", category="popup")
-
-        # Simulate peek: p1 delivered, p2 not yet
         session_db.mark_popups_delivered(db_path, [p1])
 
         args = MagicMock(ids=None)
 
-        with patch("msgbox.cli._session_id", return_value=sid):
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False):
             cli.cmd_close(args)
 
         assert p1 not in session_db.get_open_popups(db_path), "已 delivered 的 popup 应被 close"
         assert p2 not in session_db.get_open_popups(db_path), "未 delivery 的 popup 不应进入 open_popups"
 
-    def test_close_no_popups_silent(self, activated_session):
+    def test_close_no_popups_silent(self, activated_session, sid):
         """无 popup 时静默"""
-        sid, _ = activated_session
         args = MagicMock(ids=None)
 
-        with patch("msgbox.cli._session_id", return_value=sid):
-            cli.cmd_close(args)  # 不应抛异常
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False):
+            cli.cmd_close(args)
 
 
 class TestCmdWaitPopupCloseFilter:
     """验证 wait 中 popup 用 open_popups 过滤"""
 
-    def test_popup_auto_delivered_by_wait(self, activated_session, temp_central_db):
+    def test_popup_auto_delivered_by_wait(self, activated_session, temp_central_db, sid):
         """wait 标记 popup 为 delivered（供 close 识别已看过）"""
         central_db.insert_message(str(config.CENTRAL_DB), "test", "Popup!", "", category="popup")
 
         with (
-            patch("msgbox.cli.sys.exit", side_effect=SystemExit),
-            patch("msgbox.cli.time.sleep"),
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False),
+            patch(f"{_MESSAGE}._is_main_agent", return_value=True),
+            patch(f"{_MESSAGE}.sys.exit", side_effect=SystemExit),
+            patch(f"{_MESSAGE}.time.sleep"),
         ):
             with pytest.raises(SystemExit):
                 cli.cmd_wait(None)
 
-        sid, db_path = activated_session
+        _, db_path = activated_session
         assert session_db.get_open_popups(db_path, delivered_only=True) == {1}, "wait 应自动 delivered popup"
 
-    def test_popup_not_shown_after_close(self, activated_session, temp_central_db):
+    def test_popup_not_shown_after_close(self, activated_session, sid):
         """close 后的 popup 不再弹出"""
-        sid, db_path = activated_session
+        _, db_path = activated_session
         msg_id = central_db.insert_message(str(config.CENTRAL_DB), "test", "Popup!", "", category="popup")
-
-        # close it
         session_db.close_popups(db_path, [msg_id])
 
         with (
-            patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit,
-            patch("msgbox.cli.time.sleep"),
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=False),
+            patch(f"{_MESSAGE}._is_main_agent", return_value=True),
+            patch(f"{_MESSAGE}.sys.exit", side_effect=SystemExit) as mock_exit,
+            patch(f"{_MESSAGE}.time.sleep"),
         ):
             with pytest.raises(SystemExit):
                 cli.cmd_wait(None)
 
-        # exit code 2 是从超时路径来的，不是 popup 路径
-        mock_exit.assert_called_once_with(2)
+            mock_exit.assert_called_once_with(2)

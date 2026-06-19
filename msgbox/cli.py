@@ -45,15 +45,38 @@ def _session_id() -> str | None:
     return os.environ.get("CLAUDE_CODE_SESSION_ID")
 
 
+_HOOK_INPUT_CACHE = None
+
+
+def _read_hook_input():
+    """从 stdin 读取 hook 传入的 JSON 事件数据（带缓存，只读一次）。"""
+    global _HOOK_INPUT_CACHE
+    if _HOOK_INPUT_CACHE is not None:
+        return _HOOK_INPUT_CACHE
+
+    # 非 hook 场景（直接在终端运行）通常 stdin 是 tty
+    if sys.stdin.isatty():
+        _HOOK_INPUT_CACHE = {}
+        return _HOOK_INPUT_CACHE
+
+    try:
+        data = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError):
+        data = {}
+    _HOOK_INPUT_CACHE = data
+    return _HOOK_INPUT_CACHE
+
+
 def _is_main_agent() -> bool:
     """判断当前进程是否为 Claude Code 主 agent。
 
-    Claude Code 在启动子 agent（subagent / Agent 工具）时会设置
-    CLAUDE_CODE_CHILD_SESSION=1，而主 agent 不设置该变量。利用该
-    环境变量区分主/子 agent，避免同一 session 内多个子 agent 同时
-    触发消息简报提醒。
+    Hook 触发时，Claude Code 通过 stdin 传入 JSON 事件数据。
+    只有在子代理（subagent）中触发 hook 时，该数据才会包含
+    agent_id 字段。利用该字段区分主/子 agent，避免同一 session
+    内多个子 agent 同时触发消息简报提醒。
     """
-    return os.environ.get("CLAUDE_CODE_CHILD_SESSION") != "1"
+    data = _read_hook_input()
+    return data.get("agent_id") is None
 
 
 def _session_db_path(session_id: str) -> str:

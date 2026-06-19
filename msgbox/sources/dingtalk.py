@@ -151,6 +151,72 @@ def _extract_items(data: Any) -> list[dict]:
     return []
 
 
+# 当前登录用户缓存（用于过滤自己发出的消息）
+_SELF_USER: dict[str, str] = {}
+
+
+def _load_self_user() -> dict[str, str]:
+    """加载当前登录用户信息（name / userId / openDingTalkId）。"""
+    global _SELF_USER
+    if _SELF_USER:
+        return _SELF_USER
+
+    data = _dws(["contact", "user", "get-self"])
+    items = _extract_items(data)
+    if not items:
+        logger.warning("Failed to load DingTalk self user info")
+        return {}
+
+    model = items[0].get("orgEmployeeModel", {})
+    name = model.get("orgUserName", "")
+    user_id = model.get("userId", "") or model.get("orgUserId", "")
+    open_id = ""
+
+    # 通过 aisearch 获取当前用户的 openDingTalkId
+    if name:
+        search_data = _dws([
+            "aisearch", "person",
+            "--keyword", name,
+            "--dimension", "name",
+        ])
+        search_items = _extract_items(search_data)
+        for item in search_items:
+            if item.get("openDingTalkId") and item.get("userId") == user_id:
+                open_id = item["openDingTalkId"]
+                break
+
+    _SELF_USER = {
+        "name": name,
+        "userId": user_id,
+        "openDingTalkId": open_id,
+    }
+    if _SELF_USER["name"]:
+        logger.info(
+            f"DingTalk self user: name={name}, userId={user_id}, "
+            f"openDingTalkId={open_id[:20]}..."
+        )
+    return _SELF_USER
+
+
+def _is_self_message(msg: dict) -> bool:
+    """判断是否为当前登录用户自己发出的消息。"""
+    if not _SELF_USER:
+        return False
+
+    props = msg.get("props", {})
+    sender_open_id = props.get("senderOpenDingTalkId", "")
+    sender_name = props.get("senderNick", "") or msg.get("sender", "")
+
+    self_open_id = _SELF_USER.get("openDingTalkId", "")
+    self_name = _SELF_USER.get("name", "")
+
+    if self_open_id and sender_open_id == self_open_id:
+        return True
+    if self_name and sender_name == self_name:
+        return True
+    return False
+
+
 # ── Pollers ──────────────────────────────────────────────
 
 
@@ -633,6 +699,10 @@ def _insert_conversation_messages(messages: list[dict], seen_keys: set[str]):
         if mapped is None:
             continue
 
+        if _is_self_message(mapped):
+            logger.debug(f"Skipping self message: {mapped['title'][:60]}")
+            continue
+
         key = _dedup_key(mapped)
         if key and key in seen_keys:
             continue
@@ -684,6 +754,9 @@ def poll_dingtalk(interval: int, stop_event: threading.Event):
     """Main polling loop for all DingTalk sources."""
     central_db.init_central_db(config.CENTRAL_DB)
     _init_known_groups()
+
+    # 加载当前登录用户信息，用于过滤自己发出的消息
+    _load_self_user()
 
     seen_keys: set[str] = set()
     _init_known_groups()

@@ -40,10 +40,19 @@ def temp_central_db():
 def activated_session(temp_sessions_dir, temp_central_db):
     """创建一个已激活的 session（使用隔离的中央 DB）"""
     sid = "test-session-12345"
-    with patch("msgbox.cli._session_id", return_value=sid):
+    with patch("msgbox.cli._session_id", return_value=sid), patch(
+        "msgbox.cli._is_main_agent", return_value=True
+    ):
         db_path = cli._session_db_path(sid)
         session_db.init_session_db(db_path)
         yield sid, db_path
+
+
+@pytest.fixture
+def as_main_agent():
+    """强制当前进程视为主 agent，避免测试环境变量影响。"""
+    with patch("msgbox.cli._is_main_agent", return_value=True):
+        yield
 
 
 class TestCmdWaitDuration:
@@ -59,6 +68,7 @@ class TestCmdWaitDuration:
             patch.object(config, "IDLE_DURATION", idle),
             patch.object(config, "SLEEP_DURATION", sleep),
             patch("msgbox.cli._session_id", return_value="test"),
+            patch("msgbox.cli._is_main_agent", return_value=True),
             patch.object(Path, "exists", return_value=True),
             patch("msgbox.cli.session_db") as mock_session_db,
             patch("msgbox.cli.central_db") as mock_central_db,
@@ -163,6 +173,17 @@ class TestCmdWaitExitConditions:
                 cli.cmd_wait(None)
             mock_exit.assert_called_once_with(2)
 
+    def test_child_agent_silent(self):
+        """子 agent 不应触发 wait 提醒"""
+        with (
+            patch("msgbox.cli._session_id", return_value="test"),
+            patch("msgbox.cli._is_main_agent", return_value=False),
+            patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit,
+        ):
+            with pytest.raises(SystemExit):
+                cli.cmd_wait(None)
+            mock_exit.assert_called_once_with(0)
+
 
 class TestCmdPeek:
     """验证 cmd_peek 行为"""
@@ -189,12 +210,26 @@ class TestCmdPeek:
 
         with (
             patch("msgbox.cli._session_id", return_value=sid),
+            patch("msgbox.cli._is_main_agent", return_value=True),
             patch.object(config, "PEEK_COOLDOWN", 10),
         ):
             cli.cmd_peek(None)
             assert cooldown_file.exists(), "peek 后应创建冷却文件"
             # 立即再 peek 不应报错
             cli.cmd_peek(None)
+
+    def test_peek_child_agent_silent(self, temp_sessions_dir):
+        """子 agent 不应触发 peek 提醒"""
+        sid = "peek-child-test"
+        cooldown_file = Path(temp_sessions_dir) / f"{sid}.peek_ts"
+
+        with (
+            patch("msgbox.cli._session_id", return_value=sid),
+            patch("msgbox.cli._is_main_agent", return_value=False),
+            patch.object(config, "PEEK_COOLDOWN", 10),
+        ):
+            cli.cmd_peek(None)
+            assert not cooldown_file.exists(), "子 agent peek 不应创建冷却文件"
 
 
 class TestCmdWaitRegressions:
@@ -211,6 +246,7 @@ class TestCmdWaitRegressions:
 
                 with (
                     patch("msgbox.cli._session_id", return_value="reg-test"),
+                    patch("msgbox.cli._is_main_agent", return_value=True),
                     patch.object(Path, "exists", return_value=True),
                     patch("msgbox.cli.session_db") as mock_session_db,
                     patch("msgbox.cli.central_db") as mock_central_db,
@@ -274,6 +310,7 @@ class TestCmdStartAutoClose:
             patch("msgbox.cli.sys.exit", side_effect=SystemExit) as mock_exit,
             patch("msgbox.cli._touch_peek_cooldown"),
             patch("msgbox.cli._check_peek_cooldown", return_value=False),
+            patch("msgbox.cli._is_main_agent", return_value=True),
         ):
             cli.cmd_peek(None)
             assert not mock_exit.called, "历史消息不应触发 exit"

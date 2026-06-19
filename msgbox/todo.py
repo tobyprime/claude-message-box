@@ -15,7 +15,7 @@ from typing import Any
 
 from . import config
 from . import db as central_db
-from . import session as session_db
+from .session import _with_cursor, init_session_db
 
 
 # ── 时间解析 ────────────────────────────────────────────────
@@ -55,7 +55,159 @@ def format_duration(seconds: int) -> str:
     return f"{hours}h{minutes}m" if minutes else f"{hours}h"
 
 
-# ── 核心 CRUD 包装 ──────────────────────────────────────────
+# ── 核心 CRUD ──────────────────────────────────────────────
+
+
+def _next_sibling_order(db_path: str, parent_id: int | None) -> float:
+    """计算同一 parent 下新的 sibling_order（放在最后）。"""
+    row = _with_cursor(
+        db_path,
+        lambda c: c.execute(
+            "SELECT COALESCE(MAX(sibling_order), 0) FROM todos WHERE parent_id IS ?",
+            [parent_id],
+        ).fetchone(),
+    )
+    return (row[0] if row else 0) + 1.0
+
+
+def add_todo_raw(
+    db_path: str,
+    title: str,
+    approach: str,
+    duration_s: int,
+    wait_time_s: int = 0,
+    parent_id: int | None = None,
+    dependency_id: int | None = None,
+    sibling_order: float | None = None,
+) -> int:
+    """低层插入一条 todo，返回自增 id。"""
+    if sibling_order is None:
+        sibling_order = _next_sibling_order(db_path, parent_id)
+
+    def _insert(c):
+        return c.execute(
+            """
+            INSERT INTO todos (title, approach, duration_s, wait_time_s, parent_id, dependency_id, sibling_order)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [title, approach, duration_s, wait_time_s, parent_id, dependency_id, sibling_order],
+        ).lastrowid
+
+    return _with_cursor(db_path, _insert)
+
+
+def get_todo_raw(db_path: str, todo_id: int) -> dict | None:
+    """低层按 id 获取 todo。"""
+    row = _with_cursor(
+        db_path,
+        lambda c: c.execute("SELECT * FROM todos WHERE id = ?", [todo_id]).fetchone(),
+    )
+    return dict(row) if row else None
+
+
+def list_todos_raw(db_path: str, status: str | None = None) -> list[dict]:
+    """低层列出 todo，可选按 status 过滤。"""
+    if status:
+        rows = _with_cursor(
+            db_path,
+            lambda c: c.execute(
+                "SELECT * FROM todos WHERE status = ? ORDER BY sibling_order ASC, created_at ASC", [status]
+            ).fetchall(),
+        )
+    else:
+        rows = _with_cursor(
+            db_path,
+            lambda c: c.execute("SELECT * FROM todos ORDER BY sibling_order ASC, created_at ASC").fetchall(),
+        )
+    return [dict(r) for r in rows]
+
+
+def update_todo_raw(db_path: str, todo_id: int, updates: dict):
+    """低层更新 todo 字段。"""
+    allowed = {
+        "title", "approach", "duration_s", "wait_time_s", "status",
+        "parent_id", "dependency_id", "sibling_order", "activated_at", "completed_at",
+    }
+    cols = [k for k in updates if k in allowed]
+    if not cols:
+        return
+    params = [updates[k] for k in cols]
+    params.append(todo_id)
+    sql = "UPDATE todos SET " + ", ".join(f"{k} = ?" for k in cols) + " WHERE id = ?"
+    _with_cursor(db_path, lambda c: c.execute(sql, params))
+
+
+def delete_todo_raw(db_path: str, todo_id: int):
+    """低层删除 todo（级联删除子任务和提醒记录）。"""
+    def _delete(conn):
+        conn.execute("DELETE FROM todos WHERE parent_id = ?", [todo_id])
+        conn.execute("DELETE FROM todo_reminders WHERE todo_id = ?", [todo_id])
+        conn.execute("DELETE FROM todos WHERE id = ?", [todo_id])
+
+    _with_cursor(db_path, lambda c: _delete(c.connection))
+
+
+def record_reminder_raw(db_path: str, todo_id: int, stage: str):
+    """记录某 stage 的提醒已发送。"""
+    _with_cursor(
+        db_path,
+        lambda c: c.execute(
+            "INSERT OR IGNORE INTO todo_reminders (todo_id, stage) VALUES (?, ?)",
+            [todo_id, stage],
+        ),
+    )
+
+
+def has_reminder_been_sent_raw(db_path: str, todo_id: int, stage: str) -> bool:
+    """检查某 stage 的提醒是否已发送。"""
+    row = _with_cursor(
+        db_path,
+        lambda c: c.execute(
+            "SELECT 1 FROM todo_reminders WHERE todo_id = ? AND stage = ?",
+            [todo_id, stage],
+        ).fetchone(),
+    )
+    return row is not None
+
+
+def get_active_todos_raw(db_path: str) -> list[dict]:
+    """低层获取所有 active 状态的任务。"""
+    return list_todos_raw(db_path, status="active")
+
+
+def get_child_todos_raw(db_path: str, todo_id: int, status: str | None = None) -> list[dict]:
+    """低层获取某 todo 的子任务。"""
+    if status:
+        rows = _with_cursor(
+            db_path,
+            lambda c: c.execute(
+                "SELECT * FROM todos WHERE parent_id = ? AND status = ? ORDER BY sibling_order ASC, created_at ASC",
+                [todo_id, status],
+            ).fetchall(),
+        )
+    else:
+        rows = _with_cursor(
+            db_path,
+            lambda c: c.execute(
+                "SELECT * FROM todos WHERE parent_id = ? ORDER BY sibling_order ASC, created_at ASC", [todo_id]
+            ).fetchall(),
+        )
+    return [dict(r) for r in rows]
+
+
+def has_unfinished_children_raw(db_path: str, todo_id: int) -> bool:
+    """是否存在未完成的子任务。"""
+    row = _with_cursor(
+        db_path,
+        lambda c: c.execute(
+            "SELECT 1 FROM todos WHERE parent_id = ? AND status NOT IN ('done', 'cancelled') LIMIT 1",
+            [todo_id],
+        ).fetchone(),
+    )
+    return row is not None
+
+
+# ── 业务逻辑包装 ────────────────────────────────────────────
 
 
 def add_todo(
@@ -82,7 +234,7 @@ def add_todo(
             db_path, parent_id, insert_before, insert_after
         )
 
-    return session_db.add_todo(
+    return add_todo_raw(
         db_path,
         title=title,
         approach=approach,
@@ -96,7 +248,7 @@ def add_todo(
 
 def _get_sibling_orders(db_path: str, parent_id: int | None) -> list[tuple[int, float]]:
     """获取同一 parent 下所有子任务的 (id, sibling_order)，按 order 升序。"""
-    rows = session_db.list_todos(db_path)
+    rows = list_todos_raw(db_path)
     siblings = [
         (r["id"], r.get("sibling_order") or 0)
         for r in rows
@@ -117,7 +269,7 @@ def _compute_insert_order(
     使用浮点数中间值；若相邻 order 差距过小，触发重排。
     """
     target_id = insert_before or insert_after
-    todo = session_db.get_todo(db_path, target_id)
+    todo = get_todo_raw(db_path, target_id)
     if todo is None:
         raise ValueError(f"Reference todo #{target_id} not found")
     if todo.get("parent_id") != parent_id:
@@ -159,23 +311,23 @@ def _normalize_sibling_orders(db_path: str, parent_id: int | None):
     """将同一 parent 下所有子任务的 sibling_order 重新规范化为连续整数。"""
     siblings = _get_sibling_orders(db_path, parent_id)
     for i, (tid, _) in enumerate(siblings, start=1):
-        session_db.update_todo(db_path, tid, {"sibling_order": float(i)})
+        update_todo_raw(db_path, tid, {"sibling_order": float(i)})
 
 
 def get_todo(db_path: str, todo_id: int) -> dict | None:
-    return session_db.get_todo(db_path, todo_id)
+    return get_todo_raw(db_path, todo_id)
 
 
 def list_todos(db_path: str, status: str | None = None) -> list[dict]:
-    return session_db.list_todos(db_path, status=status)
+    return list_todos_raw(db_path, status=status)
 
 
 def update_todo(db_path: str, todo_id: int, **kwargs):
-    session_db.update_todo(db_path, todo_id, kwargs)
+    update_todo_raw(db_path, todo_id, kwargs)
 
 
 def delete_todo(db_path: str, todo_id: int):
-    session_db.delete_todo(db_path, todo_id)
+    delete_todo_raw(db_path, todo_id)
 
 
 def set_wait_time(db_path: str, todo_id: int, wait_time: str | int):
@@ -258,7 +410,7 @@ def mark_todo_done(db_path: str, todo_id: int) -> dict:
     if parent_id:
         parent = get_todo(db_path, parent_id)
         if parent and parent["status"] == "active":
-            children = session_db.get_child_todos(db_path, parent_id)
+            children = get_child_todos_raw(db_path, parent_id)
             if children and all(c["status"] in ("done", "cancelled") for c in children):
                 mark_todo_done(db_path, parent_id)
 
@@ -309,14 +461,13 @@ def check_and_emit_reminders(db_path: str, now: datetime | None = None) -> list[
     if now is None:
         now = datetime.now(timezone.utc)
 
-    # 确保表已存在（兼容真实运行和 mock 测试）
     try:
-        session_db.init_session_db(db_path)
+        init_session_db(db_path)
     except Exception:
         pass
 
     try:
-        active_todos = session_db.get_active_todos(db_path)
+        active_todos = get_active_todos_raw(db_path)
         if not isinstance(active_todos, list):
             return []
     except Exception:
@@ -327,7 +478,7 @@ def check_and_emit_reminders(db_path: str, now: datetime | None = None) -> list[
         stage = _calc_reminder_stage(todo, now)
         if not stage:
             continue
-        if session_db.has_reminder_been_sent(db_path, todo["id"], stage):
+        if has_reminder_been_sent_raw(db_path, todo["id"], stage):
             continue
 
         activated_at = _parse_iso(todo.get("activated_at"))
@@ -360,7 +511,7 @@ def check_and_emit_reminders(db_path: str, now: datetime | None = None) -> list[
             category="normal",
             source="todo",
         )
-        session_db.record_reminder(db_path, todo["id"], stage)
+        record_reminder_raw(db_path, todo["id"], stage)
         emitted.append({
             "id": msg_id,
             "type": "todo.reminder",
@@ -381,8 +532,8 @@ def get_current_tasks(db_path: str) -> list[dict]:
     对 active 任务：若有未完成子任务，则返回这些子任务；否则返回自身。
     """
     try:
-        session_db.init_session_db(db_path)
-        todos = session_db.get_active_todos(db_path)
+        init_session_db(db_path)
+        todos = get_active_todos_raw(db_path)
         if not isinstance(todos, list):
             return []
     except Exception:
@@ -391,8 +542,8 @@ def get_current_tasks(db_path: str) -> list[dict]:
     result: list[dict] = []
     for todo in todos:
         try:
-            if session_db.has_unfinished_children(db_path, todo["id"]):
-                children = session_db.get_child_todos(
+            if has_unfinished_children_raw(db_path, todo["id"]):
+                children = get_child_todos_raw(
                     db_path, todo["id"], status=None
                 )
                 for child in children:

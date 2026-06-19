@@ -187,20 +187,6 @@ def get_undelivered_messages(db_path: str, excluded_ids: set[int], categories: t
     """兼容旧 API：基于排除集合查询未读消息。"""
     return get_messages_after(db_path, 0, categories, excluded_ids=excluded_ids, limit=limit)
 
-    if not excluded_ids:
-        placeholders = ""
-        params: list = []
-    else:
-        placeholders = " AND id NOT IN (" + ",".join("?" * len(excluded_ids)) + ")"
-        params = list(excluded_ids)
-    cat_placeholders = ",".join("?" * len(categories))
-    sql = f"SELECT * FROM messages WHERE category IN ({cat_placeholders}){placeholders} ORDER BY id ASC LIMIT ?"
-    rows = _with_cursor(
-        db_path,
-        lambda c: c.execute(sql, list(categories) + params + [limit]).fetchall(),
-    )
-    return [dict(r) for r in rows]
-
 
 def message_exists_by_url(db_path: str, source: str, url: str) -> bool:
     """检查是否存在相同 source + url 的消息（用于去重）"""

@@ -49,7 +49,7 @@ def db(temp_sessions_dir, temp_central_db):
 def _activate_at(db_path: int, todo_id: int, ago_seconds: int):
     """辅助：将任务激活时间设为 ago_seconds 前。"""
     activated_at = (datetime.now(timezone.utc) - timedelta(seconds=ago_seconds)).isoformat()
-    session_db.update_todo(db_path, todo_id, {"status": "active", "activated_at": activated_at})
+    todo_logic.update_todo_raw(db_path, todo_id, {"status": "active", "activated_at": activated_at})
 
 
 class TestParseDuration:
@@ -110,21 +110,21 @@ class TestSiblingOrder:
         a = todo_logic.add_todo(db, "A", "", "5m")
         b = todo_logic.add_todo(db, "B", "", "5m", parent_id=a)
         c = todo_logic.add_todo(db, "C", "", "5m", parent_id=a)
-        children = session_db.get_child_todos(db, a)
+        children = todo_logic.get_child_todos_raw(db, a)
         assert [c["title"] for c in children] == ["B", "C"]
 
     def test_insert_after(self, db):
         a = todo_logic.add_todo(db, "A", "", "5m")
         b = todo_logic.add_todo(db, "B", "", "5m", parent_id=a)
         c = todo_logic.add_todo(db, "C", "", "5m", parent_id=a, insert_after=b)
-        children = session_db.get_child_todos(db, a)
+        children = todo_logic.get_child_todos_raw(db, a)
         assert [c["title"] for c in children] == ["B", "C"]
 
     def test_insert_before(self, db):
         a = todo_logic.add_todo(db, "A", "", "5m")
         b = todo_logic.add_todo(db, "B", "", "5m", parent_id=a)
         c = todo_logic.add_todo(db, "C", "", "5m", parent_id=a, insert_before=b)
-        children = session_db.get_child_todos(db, a)
+        children = todo_logic.get_child_todos_raw(db, a)
         assert [c["title"] for c in children] == ["C", "B"]
 
     def test_insert_between(self, db):
@@ -132,7 +132,7 @@ class TestSiblingOrder:
         b = todo_logic.add_todo(db, "B", "", "5m", parent_id=a)
         d = todo_logic.add_todo(db, "D", "", "5m", parent_id=a)
         c = todo_logic.add_todo(db, "C", "", "5m", parent_id=a, insert_after=b)
-        children = session_db.get_child_todos(db, a)
+        children = todo_logic.get_child_todos_raw(db, a)
         assert [c["title"] for c in children] == ["B", "C", "D"]
 
     def test_insert_requires_same_parent(self, db):

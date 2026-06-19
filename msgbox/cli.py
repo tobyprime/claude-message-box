@@ -17,6 +17,7 @@ if sys.stderr.encoding and sys.stderr.encoding.upper() not in ("UTF-8", "UTF8"):
 from . import config
 from . import db as central_db
 from . import session as session_db
+from . import todo as todo_logic
 from .filter import classify_message
 from .sources.github import run_server, get_github_config
 from .sources.inbox import run_inbox_source
@@ -25,9 +26,34 @@ from .template import render_brief
 from .yaml_config import add_rule, get_config_value, list_rules, load_config, remove_rule, set_config_value
 
 
+def _require_session_db():
+    """返回当前会话的 db_path，若未激活则退出。"""
+    sid = _session_id()
+    if not sid:
+        print("CLAUDE_CODE_SESSION_ID not set", file=sys.stderr)
+        sys.exit(1)
+    db_path = _session_db_path(sid)
+    if not Path(db_path).exists():
+        print("msg_box not active", file=sys.stderr)
+        sys.exit(1)
+    session_db.init_session_db(db_path)
+    return db_path
+
+
 def _session_id() -> str | None:
     """从环境变量获取 Claude Code session_id"""
     return os.environ.get("CLAUDE_CODE_SESSION_ID")
+
+
+def _is_main_agent() -> bool:
+    """判断当前进程是否为 Claude Code 主 agent。
+
+    Claude Code 在启动子 agent（subagent / Agent 工具）时会设置
+    CLAUDE_CODE_CHILD_SESSION=1，而主 agent 不设置该变量。利用该
+    环境变量区分主/子 agent，避免同一 session 内多个子 agent 同时
+    触发消息简报提醒。
+    """
+    return os.environ.get("CLAUDE_CODE_CHILD_SESSION") != "1"
 
 
 def _session_db_path(session_id: str) -> str:
@@ -107,6 +133,9 @@ def cmd_wait(args):
     if not sid:
         sys.exit(0)
 
+    if not _is_main_agent():
+        sys.exit(0)
+
     db_path = _session_db_path(sid)
     if not Path(db_path).exists():
         sys.exit(0)
@@ -144,11 +173,23 @@ def cmd_wait(args):
         if popups:
             session_db.mark_popups_delivered(db_path, [m["id"] for m in popups])
 
+    wait_start = time.monotonic()
+
+    # Phase 0: 检查 todo reminder
+    todo_logic.check_and_emit_reminders(db_path)
+
+    # 预计算活跃任务摘要，供模板使用
+    active_todos_var = todo_logic.format_active_todos(db_path)
+
     # Phase 1: 检查 popup（立即返回）
     popups, msgs = _collect_pending()
     if popups:
         _deliver(popups, msgs)
-        output = render_brief(brief_template, item_template, popups, msgs, group_templates=group_templates)
+        output = render_brief(
+            brief_template, item_template, popups, msgs,
+            group_templates=group_templates,
+            extra_vars={"ACTIVE_TODOS": active_todos_var},
+        )
         print(output, file=sys.stderr)
         sys.exit(2)
 
@@ -159,14 +200,53 @@ def cmd_wait(args):
     while elapsed < total_duration:
         time.sleep(poll_interval)
         elapsed += poll_interval
+
+        # 轮询中检查 todo reminder
+        todo_logic.check_and_emit_reminders(db_path)
+
+        # 检查是否超过 active todo 的 wait_time，需要重新激活会话
+        current_wait_elapsed = int(time.monotonic() - wait_start)
+        resume_tasks = todo_logic.check_resume_needed(db_path, current_wait_elapsed)
+        if resume_tasks:
+            todo_logic.emit_resume_message(db_path, resume_tasks)
+            popups, msgs = _collect_pending()
+            if msgs:
+                _deliver(popups, msgs)
+                output = render_brief(
+                    brief_template, item_template, popups, msgs,
+                    group_templates=group_templates,
+                    extra_vars={"ACTIVE_TODOS": todo_logic.format_active_todos(db_path)},
+                )
+                print(output, file=sys.stderr)
+                sys.exit(2)
+
         popups, msgs = _collect_pending()
         if popups or msgs:
             _deliver(popups, msgs)
-            output = render_brief(brief_template, item_template, popups, msgs, group_templates=group_templates)
+            output = render_brief(
+                brief_template, item_template, popups, msgs,
+                group_templates=group_templates,
+                extra_vars={"ACTIVE_TODOS": todo_logic.format_active_todos(db_path)},
+            )
             print(output, file=sys.stderr)
             sys.exit(2)
 
-    # 无消息 — 报告状态后告知 Claude
+    # 兜底：循环结束后再次检查 resume
+    wait_elapsed = int(time.monotonic() - wait_start)
+    resume_tasks = todo_logic.check_resume_needed(db_path, wait_elapsed)
+    if resume_tasks:
+        todo_logic.emit_resume_message(db_path, resume_tasks)
+        popups, msgs = _collect_pending()
+        if msgs:
+            _deliver(popups, msgs)
+            output = render_brief(
+                brief_template, item_template, popups, msgs,
+                group_templates=group_templates,
+                extra_vars={"ACTIVE_TODOS": todo_logic.format_active_todos(db_path)},
+            )
+            print(output, file=sys.stderr)
+            sys.exit(2)
+
     print(f"Waited {total_duration}s, no new messages", file=sys.stderr)
     sys.exit(2)
 
@@ -199,6 +279,9 @@ def cmd_peek(args):
     if not sid:
         return
 
+    if not _is_main_agent():
+        return
+
     if _check_peek_cooldown(sid):
         return
     _touch_peek_cooldown(sid)
@@ -215,6 +298,9 @@ def cmd_peek(args):
     brief_template = templates.get("brief_peek") or templates.get("brief", "")
     item_template = templates.get("item", "")
     group_templates = templates.get("groups", {})
+
+    # Phase 0: 检查 todo reminder
+    todo_logic.check_and_emit_reminders(db_path)
 
     cursor = session_db.get_read_cursor(db_path)
     open_popups = session_db.get_open_popups(db_path)
@@ -234,7 +320,12 @@ def cmd_peek(args):
     if popups:
         session_db.mark_popups_delivered(db_path, [m["id"] for m in popups])
 
-    output = render_brief(brief_template, item_template, popups, msgs, group_templates=group_templates)
+    active_todos_var = todo_logic.format_active_todos(db_path)
+    output = render_brief(
+        brief_template, item_template, popups, msgs,
+        group_templates=group_templates,
+        extra_vars={"ACTIVE_TODOS": active_todos_var},
+    )
     print(output, file=sys.stderr)
     sys.exit(2)
 
@@ -533,6 +624,157 @@ def cmd_list_sessions(args):
         print(f"  {s['project']:30s} {s['session_id']}")
 
 
+# ── msgbox todo ─────────────────────────────────────────────
+
+
+def _todo_session():
+    """获取当前激活会话的 db_path，用于 todo 命令。"""
+    return _require_session_db()
+
+
+def cmd_todo_add(args):
+    db_path = _todo_session()
+    parent_id = args.parent
+    dependency_id = args.after
+    insert_before = args.insert_before
+    insert_after = args.insert_after
+
+    if dependency_id is not None and session_db.get_todo(db_path, dependency_id) is None:
+        print(f"Dependency todo #{dependency_id} not found", file=sys.stderr)
+        sys.exit(1)
+    if parent_id is not None and session_db.get_todo(db_path, parent_id) is None:
+        print(f"Parent todo #{parent_id} not found", file=sys.stderr)
+        sys.exit(1)
+    if insert_before is not None and session_db.get_todo(db_path, insert_before) is None:
+        print(f"Insert-before todo #{insert_before} not found", file=sys.stderr)
+        sys.exit(1)
+    if insert_after is not None and session_db.get_todo(db_path, insert_after) is None:
+        print(f"Insert-after todo #{insert_after} not found", file=sys.stderr)
+        sys.exit(1)
+    if (insert_before is not None or insert_after is not None) and parent_id is None:
+        print("--insert-before/--insert-after require --parent", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        todo_id = todo_logic.add_todo(
+            db_path,
+            title=args.title,
+            approach=args.approach or "",
+            duration=args.duration,
+            wait_time=args.wait_time or 0,
+            parent_id=parent_id,
+            dependency_id=dependency_id,
+            insert_before=insert_before,
+            insert_after=insert_after,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+    print(f"Todo #{todo_id} added: {args.title}")
+
+
+def cmd_todo_list(args):
+    db_path = _todo_session()
+    todos = todo_logic.list_todos(db_path, status=args.status)
+    if not todos:
+        print("No todos")
+        return
+    for t in todos:
+        status = t["status"]
+        duration = todo_logic.format_duration(t["duration_s"])
+        wait = ""
+        if t.get("wait_time_s"):
+            wait = f", wait={todo_logic.format_duration(t['wait_time_s'])}"
+        print(f"  #{t['id']} [{status}] {t['title']} ({duration}{wait})")
+
+
+def cmd_todo_tree(args):
+    db_path = _todo_session()
+    todos = todo_logic.list_todos(db_path)
+    if not todos:
+        print("No todos")
+        return
+    tree = todo_logic.build_todo_tree(todos)
+    for line in todo_logic.format_todo_tree(tree):
+        print(line)
+
+
+def cmd_todo_start(args):
+    db_path = _todo_session()
+    result = todo_logic.activate_todo(db_path, args.id)
+    if not result["ok"]:
+        print(result["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"Todo #{args.id} activated")
+
+
+def cmd_todo_done(args):
+    db_path = _todo_session()
+    result = todo_logic.mark_todo_done(db_path, args.id)
+    if not result["ok"]:
+        print(result["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"Todo #{args.id} marked as done")
+
+
+def cmd_todo_cancel(args):
+    db_path = _todo_session()
+    result = todo_logic.cancel_todo(db_path, args.id)
+    if not result["ok"]:
+        print(result["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"Todo #{args.id} cancelled")
+
+
+def cmd_todo_delete(args):
+    db_path = _todo_session()
+    if session_db.get_todo(db_path, args.id) is None:
+        print(f"Todo #{args.id} not found", file=sys.stderr)
+        sys.exit(1)
+    todo_logic.delete_todo(db_path, args.id)
+    print(f"Todo #{args.id} deleted")
+
+
+def cmd_todo_wait_time(args):
+    db_path = _todo_session()
+    if session_db.get_todo(db_path, args.id) is None:
+        print(f"Todo #{args.id} not found", file=sys.stderr)
+        sys.exit(1)
+    try:
+        todo_logic.set_wait_time(db_path, args.id, args.duration)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+    print(f"Todo #{args.id} wait-time set to {args.duration}")
+
+
+def cmd_todo_active(args):
+    db_path = _todo_session()
+    active = todo_logic.get_current_tasks(db_path)
+    if not active:
+        print("No active todos")
+        return
+    for t in active:
+        activated_at = t.get("activated_at")
+        elapsed = "?"
+        remaining = "?"
+        if activated_at:
+            try:
+                from datetime import datetime, timezone
+
+                ts = datetime.fromisoformat(activated_at)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                elapsed_s = int((datetime.now(timezone.utc) - ts).total_seconds())
+                elapsed = todo_logic.format_duration(elapsed_s)
+                remaining = todo_logic.format_duration(max(0, t["duration_s"] - elapsed_s))
+            except (ValueError, TypeError):
+                pass
+        print(
+            f"  #{t['id']} {t['title']} — 已进行 {elapsed}，剩余 {remaining}"
+        )
+
+
 # ── argparse ────────────────────────────────────────────────
 
 
@@ -636,6 +878,52 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("list-sessions", help="List active sessions")
     sp.set_defaults(func=cmd_list_sessions)
+
+    # todo 子命令
+    tp = sub.add_parser("todo", help="Manage session todos")
+    tsub = tp.add_subparsers(dest="todo_cmd")
+
+    sp = tsub.add_parser("add", help="Add a todo")
+    sp.add_argument("--title", required=True)
+    sp.add_argument("--approach", default="")
+    sp.add_argument("--duration", required=True, help="Duration like 30s, 5m, 2h")
+    sp.add_argument("--wait-time", default="", help="Wait time like 30s, 5m; 0 disables resume")
+    sp.add_argument("--parent", type=int, help="Parent todo id")
+    sp.add_argument("--after", type=int, help="Dependency todo id (must finish before this)")
+    sp.add_argument("--insert-before", type=int, help="Sibling todo id to insert before (requires --parent)")
+    sp.add_argument("--insert-after", type=int, help="Sibling todo id to insert after (requires --parent)")
+    sp.set_defaults(func=cmd_todo_add)
+
+    sp = tsub.add_parser("list", help="List todos")
+    sp.add_argument("--status", choices=["pending", "active", "paused", "done", "cancelled"])
+    sp.set_defaults(func=cmd_todo_list)
+
+    sp = tsub.add_parser("tree", help="Show todo tree")
+    sp.set_defaults(func=cmd_todo_tree)
+
+    sp = tsub.add_parser("start", help="Activate a todo")
+    sp.add_argument("id", type=int)
+    sp.set_defaults(func=cmd_todo_start)
+
+    sp = tsub.add_parser("done", help="Mark a todo as done")
+    sp.add_argument("id", type=int)
+    sp.set_defaults(func=cmd_todo_done)
+
+    sp = tsub.add_parser("cancel", help="Cancel a todo")
+    sp.add_argument("id", type=int)
+    sp.set_defaults(func=cmd_todo_cancel)
+
+    sp = tsub.add_parser("delete", help="Delete a todo")
+    sp.add_argument("id", type=int)
+    sp.set_defaults(func=cmd_todo_delete)
+
+    sp = tsub.add_parser("wait-time", help="Set wait-time for a todo")
+    sp.add_argument("id", type=int)
+    sp.add_argument("duration", help="Wait time like 30s, 5m")
+    sp.set_defaults(func=cmd_todo_wait_time)
+
+    sp = tsub.add_parser("active", help="Show current active todos")
+    sp.set_defaults(func=cmd_todo_active)
 
     return p
 

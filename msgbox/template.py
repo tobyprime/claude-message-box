@@ -187,6 +187,7 @@ def render_brief(
     normal_messages: list[dict],
     silent_messages: list[dict] | None = None,
     group_templates: dict[str, str] | None = None,
+    extra_vars: dict[str, str] | None = None,
 ) -> str:
     """渲染消息简报（按类型聚合展示）"""
     popup_items = _render_grouped(popup_messages, item_template, group_templates=group_templates)
@@ -201,4 +202,6 @@ def render_brief(
         "NEW_MESSAGES": "\n".join(normal_items) if normal_items else "",
         "NEW_SILENT_MESSAGES": "\n".join(silent_items) if silent_items else "",
     }
+    if extra_vars:
+        vars.update(extra_vars)
     return render(brief_template, vars)

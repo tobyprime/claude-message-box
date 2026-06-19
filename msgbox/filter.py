@@ -14,6 +14,10 @@ from .yaml_config import load_config
 
 def classify_message(type_: str, props: dict[str, str]) -> str:
     """按规则分类消息: popup / silent / normal"""
+    # todo 内部消息始终至少为 normal，避免被用户规则误 silent
+    if type_.startswith("todo."):
+        return "normal"
+
     cfg = load_config()
     rules = cfg.get("rules", {})
 

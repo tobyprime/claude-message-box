@@ -38,6 +38,34 @@ def _with_cursor(db_path: str, cb):
 # ── 中央数据库 ──────────────────────────────────────────────
 
 
+def _build_for_session_clause(for_session: str | None) -> tuple[str, list]:
+    """Build SQL fragment and params for for_session filtering.
+    When for_session is set, matches broadcast (NULL) OR session-targeted messages.
+    When None, only returns broadcast (NULL) messages for backward compatibility.
+    """
+    if for_session is not None:
+        return "(for_session IS NULL OR for_session = ?)", [for_session]
+    return "for_session IS NULL", []
+
+
+def _migrate_add_column(db_path: str, column_def: str, index_name: str, index_col: str):
+    """Safely add a column and its index, skipping if already present."""
+    try:
+        _with_cursor(
+            db_path,
+            lambda c: c.execute(f"ALTER TABLE messages ADD COLUMN {column_def};"),
+        )
+    except Exception:
+        pass
+    try:
+        _with_cursor(
+            db_path,
+            lambda c: c.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON messages({index_col});"),
+        )
+    except Exception:
+        pass
+
+
 def init_central_db(db_path: str):
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     _with_cursor(
@@ -52,41 +80,30 @@ def init_central_db(db_path: str):
             content     TEXT    NOT NULL DEFAULT '',
             category    TEXT    NOT NULL DEFAULT 'normal',
             source      TEXT    NOT NULL DEFAULT '',
+            for_session TEXT,
             created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_messages_created_at
             ON messages(created_at);
         CREATE INDEX IF NOT EXISTS idx_messages_category
             ON messages(category);
-        CREATE INDEX IF NOT EXISTS idx_messages_category
-            ON messages(category);
+        CREATE INDEX IF NOT EXISTS idx_messages_for_session
+            ON messages(for_session);
         """
         ),
     )
-    # Migration: add source column + index if missing (for existing DBs created before)
-    try:
-        _with_cursor(
-            db_path,
-            lambda c: c.execute("ALTER TABLE messages ADD COLUMN source TEXT NOT NULL DEFAULT '';"),
-        )
-    except Exception:
-        pass  # Column already exists
-    try:
-        _with_cursor(
-            db_path,
-            lambda c: c.execute("CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source);"),
-        )
-    except Exception:
-        pass  # Index already exists
+    # Migrations for existing DBs
+    _migrate_add_column(db_path, "source TEXT NOT NULL DEFAULT ''", "idx_messages_source", "source")
+    _migrate_add_column(db_path, "for_session TEXT", "idx_messages_for_session", "for_session")
 
 
-def insert_message(db_path: str, type_: str, title: str, content: str, props: dict | None = None, category: str = "normal", source: str = "") -> int:
+def insert_message(db_path: str, type_: str, title: str, content: str, props: dict | None = None, category: str = "normal", source: str = "", for_session: str | None = None) -> int:
     init_central_db(db_path)
     row_id = _with_cursor(
         db_path,
         lambda c: c.execute(
-            "INSERT INTO messages (type, title, content, props, category, source) VALUES (?, ?, ?, ?, ?, ?)",
-            [type_, title, content, json.dumps(props or {}), category, source],
+            "INSERT INTO messages (type, title, content, props, category, source, for_session) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [type_, title, content, json.dumps(props or {}), category, source, for_session],
         ).lastrowid,
     )
     return row_id
@@ -103,16 +120,19 @@ def get_messages_since(db_path: str, since_id: int, limit: int = 50) -> list[dic
     return [dict(r) for r in rows]
 
 
-def get_messages_by_ids(db_path: str, ids: list[int]) -> list[dict]:
+def get_messages_by_ids(db_path: str, ids: list[int], for_session: str | None = None) -> list[dict]:
     if not ids:
         return []
     placeholders = ",".join("?" * len(ids))
+    params: list = ids[:]
+    sql = f"SELECT * FROM messages WHERE id IN ({placeholders})"
+    if for_session is not None:
+        sql += " AND (for_session IS NULL OR for_session = ?)"
+        params.append(for_session)
+    sql += " ORDER BY id ASC"
     rows = _with_cursor(
         db_path,
-        lambda c: c.execute(
-            f"SELECT * FROM messages WHERE id IN ({placeholders}) ORDER BY id ASC",
-            ids,
-        ).fetchall(),
+        lambda c: c.execute(sql, params).fetchall(),
     )
     return [dict(r) for r in rows]
 
@@ -156,9 +176,10 @@ def get_messages_after(
     after_id: int,
     categories: tuple[str, ...],
     excluded_ids: set[int] | None = None,
+    for_session: str | None = None,
     limit: int = 50,
 ) -> list[dict]:
-    """查询 id > after_id、指定类别、可选排除集合的消息。"""
+    """查询 id > after_id、指定类别、可选排除集合、可选 session 过滤的消息。"""
     conditions = ["id > ?"]
     params: list = [after_id]
 
@@ -172,6 +193,11 @@ def get_messages_after(
         conditions.append(f"id NOT IN ({placeholders})")
         params.extend(excluded_ids)
 
+    clause, clause_params = _build_for_session_clause(for_session)
+    if clause:
+        conditions.append(clause)
+        params.extend(clause_params)
+
     where_clause = " WHERE " + " AND ".join(conditions)
     sql = f"SELECT * FROM messages{where_clause} ORDER BY id ASC LIMIT ?"
     params.append(limit)
@@ -183,9 +209,9 @@ def get_messages_after(
     return [dict(r) for r in rows]
 
 
-def get_undelivered_messages(db_path: str, excluded_ids: set[int], categories: tuple[str, ...], limit: int = 50) -> list[dict]:
+def get_undelivered_messages(db_path: str, excluded_ids: set[int], categories: tuple[str, ...], for_session: str | None = None, limit: int = 50) -> list[dict]:
     """兼容旧 API：基于排除集合查询未读消息。"""
-    return get_messages_after(db_path, 0, categories, excluded_ids=excluded_ids, limit=limit)
+    return get_messages_after(db_path, 0, categories, excluded_ids=excluded_ids, for_session=for_session, limit=limit)
 
 
 def message_exists_by_url(db_path: str, source: str, url: str) -> bool:
@@ -209,15 +235,9 @@ def get_messages(
     offset: int = 0,
     categories: tuple[str, ...] | None = None,
     type_pattern: str | None = None,
+    for_session: str | None = None,
 ) -> list[dict]:
-    """查询历史消息，支持分页和类别/类型过滤。
-
-    SELECT * FROM messages
-    [WHERE category IN (...)]
-    [AND type LIKE ...]
-    ORDER BY id DESC
-    LIMIT ? OFFSET ?
-    """
+    """查询历史消息，支持分页和类别/类型过滤。"""
     conditions: list[str] = []
     params: list = []
 
@@ -230,9 +250,12 @@ def get_messages(
         conditions.append("type LIKE ?")
         params.append(type_pattern.replace("*", "%"))
 
-    where_clause = ""
-    if conditions:
-        where_clause = " WHERE " + " AND ".join(conditions)
+    clause, clause_params = _build_for_session_clause(for_session)
+    if clause:
+        conditions.append(clause)
+        params.extend(clause_params)
+
+    where_clause = " WHERE " + " AND ".join(conditions)
 
     sql = f"SELECT * FROM messages{where_clause} ORDER BY id DESC LIMIT ? OFFSET ?"
     params.extend([limit, offset])

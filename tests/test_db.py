@@ -139,3 +139,56 @@ class TestGetMessages:
     def test_empty_db(self, db_path):
         msgs = central_db.get_messages(db_path)
         assert msgs == []
+
+
+class TestForSession:
+    def test_insert_with_session(self, db_path):
+        """发送给指定 session 的消息应只有目标 session 能看到。"""
+        sid_a = "session-a"
+        sid_b = "session-b"
+
+        # 广播消息
+        central_db.insert_message(db_path, "broadcast", "B", "C", category="normal")
+        # 定向给 A
+        central_db.insert_message(db_path, "direct", "To A", "C", category="normal", for_session=sid_a)
+        # 定向给 B
+        central_db.insert_message(db_path, "direct", "To B", "C", category="normal", for_session=sid_b)
+
+        # A 应看到广播 + 自己的消息
+        msgs_a = central_db.get_messages_after(db_path, 0, ("normal",), for_session=sid_a)
+        assert len(msgs_a) == 2
+        assert msgs_a[0]["id"] == 1
+        assert msgs_a[1]["id"] == 2
+
+        # B 应看到广播 + 自己的消息
+        msgs_b = central_db.get_messages_after(db_path, 0, ("normal",), for_session=sid_b)
+        assert len(msgs_b) == 2
+        assert msgs_b[0]["id"] == 1
+        assert msgs_b[1]["id"] == 3
+
+        # 无 session 过滤应只看到广播 (向后兼容)
+        msgs = central_db.get_messages_after(db_path, 0, ("normal",))
+        assert len(msgs) == 1
+        assert msgs[0]["id"] == 1
+
+    def test_get_messages_by_ids_with_session(self, db_path):
+        central_db.insert_message(db_path, "b", "B", "C", category="normal")
+        central_db.insert_message(db_path, "d", "D", "C", category="normal", for_session="s1")
+
+        # for_session=s1 应看到定向消息 + 广播
+        msgs = central_db.get_messages_by_ids(db_path, [1, 2], for_session="s1")
+        assert len(msgs) == 2
+
+        # 不过滤时返回所有（精确 ID 查询）
+        msgs = central_db.get_messages_by_ids(db_path, [1, 2])
+        assert len(msgs) == 2
+
+    def test_get_messages_with_session(self, db_path):
+        central_db.insert_message(db_path, "b", "B", "C", category="normal")
+        central_db.insert_message(db_path, "d", "D", "C", category="normal", for_session="s1")
+
+        msgs = central_db.get_messages(db_path, for_session="s1")
+        assert len(msgs) == 2
+
+        msgs = central_db.get_messages(db_path)
+        assert len(msgs) == 1

@@ -17,19 +17,8 @@
         "hooks": [
           {
             "type": "command",
-            "timeout": 5000,
+            "timeout": 1000,
             "command": "msgbox peek"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "timeout": 660000,
-            "command": "msgbox wait"
           }
         ]
       }

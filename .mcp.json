@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "msgbox": {
+      "type": "stdio",
+      "command": "msgbox",
+      "args": ["channel"]
+    }
+  }
+}

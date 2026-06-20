@@ -13,11 +13,8 @@ from .. import todo as todo_logic
 from ..filter import classify_message
 from ..template import render_brief
 from ..yaml_config import load_config
-from .session import _is_main_agent, _require_session_db, _session_db_path, _read_hook_input
+from .session import _is_main_agent, _require_session_db, _session_db_path, _session_id, _read_hook_input
 
-
-def _session_id():
-    return os.environ.get("CLAUDE_CODE_SESSION_ID")
 
 
 def cmd_send(args):
@@ -40,8 +37,12 @@ def cmd_send(args):
         content=args.content,
         props=props,
         category=category,
+        for_session=args.session,
     )
-    print(f"Message #{msg_id} stored (category: {category})")
+    parts = [f"Message #{msg_id} stored (category: {category})"]
+    if args.session:
+        parts.append(f"for_session: {args.session}")
+    print(" ".join(parts))
 
 
 def cmd_wait(args):
@@ -71,13 +72,14 @@ def cmd_wait(args):
         cursor = session_db.get_read_cursor(db_path)
         open_popups = session_db.get_open_popups(db_path)
         new_popups = central_db.get_messages_after(
-            config.CENTRAL_DB, cursor, ("popup",), excluded_ids=open_popups
+            config.CENTRAL_DB, cursor, ("popup",), excluded_ids=open_popups,
+            for_session=sid,
         )
         open_popup_msgs = central_db.get_messages_by_ids(
-            config.CENTRAL_DB, list(open_popups)
+            config.CENTRAL_DB, list(open_popups), for_session=sid,
         )
         popups = new_popups + open_popup_msgs
-        msgs = central_db.get_messages_after(config.CENTRAL_DB, cursor, ("normal",))
+        msgs = central_db.get_messages_after(config.CENTRAL_DB, cursor, ("normal",), for_session=sid)
         return popups, msgs
 
     def _deliver(popups, msgs):
@@ -226,11 +228,12 @@ def cmd_peek(args):
     open_popups = session_db.get_open_popups(db_path)
 
     new_popups = central_db.get_messages_after(
-        config.CENTRAL_DB, cursor, ("popup",), excluded_ids=open_popups
+        config.CENTRAL_DB, cursor, ("popup",), excluded_ids=open_popups,
+        for_session=sid,
     )
-    open_popup_msgs = central_db.get_messages_by_ids(config.CENTRAL_DB, list(open_popups))
+    open_popup_msgs = central_db.get_messages_by_ids(config.CENTRAL_DB, list(open_popups), for_session=sid)
     popups = new_popups + open_popup_msgs
-    msgs = central_db.get_messages_after(config.CENTRAL_DB, cursor, ("normal",))
+    msgs = central_db.get_messages_after(config.CENTRAL_DB, cursor, ("normal",), for_session=sid)
 
     if not popups and not msgs:
         return
@@ -310,12 +313,14 @@ def cmd_mark_done(args):
 def cmd_history(args):
     central_db.init_central_db(config.CENTRAL_DB)
 
+    sid = _session_id()
     msgs = central_db.get_messages(
         config.CENTRAL_DB,
         limit=args.limit,
         offset=args.offset,
         categories=tuple(args.category) if args.category else None,
         type_pattern=args.type,
+        for_session=sid,
     )
 
     if not msgs:

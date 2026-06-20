@@ -15,9 +15,9 @@ from .commands.session import (
     cmd_start, cmd_stop, cmd_list_sessions,
     _session_id, _is_main_agent, _session_db_path, _require_session_db, _read_hook_input,
 )
+from .channel import cmd_channel
 from .commands.message import cmd_wait, cmd_peek, cmd_send, cmd_close, cmd_mark_done, cmd_history, cmd_debug_hook
-from .commands.todo import (
-    cmd_todo_add, cmd_todo_list, cmd_todo_tree, cmd_todo_start, cmd_todo_done,
+from .commands.todo import (    cmd_todo_add, cmd_todo_list, cmd_todo_tree, cmd_todo_start, cmd_todo_done,
     cmd_todo_cancel, cmd_todo_delete, cmd_todo_wait_time, cmd_todo_active,
 )
 from .commands.config import cmd_config_get, cmd_config_set, cmd_config_rules, cmd_config_rules_add, cmd_config_rules_remove
@@ -43,10 +43,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--content", default="")
     sp.add_argument("--props", default="{}")
     sp.add_argument("--category", choices=["popup", "normal", "silent", ""], default="")
+    sp.add_argument("--session", help="Target session ID (omit for broadcast)")
     sp.set_defaults(func=cmd_send)
 
     sp = sub.add_parser("wait", help="Wait for messages (hook use)")
     sp.set_defaults(func=cmd_wait)
+
+    sp = sub.add_parser("channel", help="Start MCP Channel server (experimental)")
+    sp.set_defaults(func=cmd_channel)
 
     sp = sub.add_parser("peek", help="Quick peek for new messages (hook use)")
     sp.set_defaults(func=cmd_peek)
